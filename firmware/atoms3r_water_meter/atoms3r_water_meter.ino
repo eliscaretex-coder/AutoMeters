@@ -39,7 +39,7 @@
 #define SUPABASE_URL "https://obdltdjykzrxxpozupqt.supabase.co"
 #endif
 #ifndef SUPABASE_KEY
-#define SUPABASE_KEY ""   // publishable key (sb_publishable_...) or legacy anon key
+#define SUPABASE_KEY "sb_publishable_BQwFl3_6XV9igdkYUJTFbA_UHM5OhOZ"   // publishable key (public by design)
 #endif
 #ifndef INGEST_TOKEN
 #define INGEST_TOKEN ""   // from: select private.create_ingest_token('...');
