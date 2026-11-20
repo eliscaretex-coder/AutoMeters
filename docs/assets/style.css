@@ -1,0 +1,129 @@
+:root {
+  --bg: #f4f4f2;
+  --surface: #fcfcfb;
+  --border: #e3e2de;
+  --ink: #1d1d1b;
+  --ink-2: #4b4a46;
+  --muted: #74736e;
+  --grid: #ecebe7;
+  --axis: #c9c8c3;
+  --accent: #2a78d6;
+  --ok: #2e8540;
+  --warn: #b35c00;
+  --cold: #2a78d6;
+  --warm: #d18a00;
+  --hot: #d6453d;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121211;
+    --surface: #1a1a19;
+    --border: #2e2e2c;
+    --ink: #ecebe7;
+    --ink-2: #c4c3be;
+    --muted: #93928c;
+    --grid: #262624;
+    --axis: #44433f;
+    --accent: #3987e5;
+    --ok: #5cb86e;
+    --warn: #e39b4a;
+    --cold: #3987e5;
+    --warm: #b8870f;
+    --hot: #e8606e;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121211; --surface: #1a1a19; --border: #2e2e2c; --ink: #ecebe7; --ink-2: #c4c3be;
+  --muted: #93928c; --grid: #262624; --axis: #44433f; --accent: #3987e5; --ok: #5cb86e;
+  --warn: #e39b4a; --cold: #3987e5; --warm: #b8870f; --hot: #e8606e; color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 16px; }
+.top { background: var(--surface); border-bottom: 1px solid var(--border); padding: 14px 0; margin-bottom: 16px; }
+h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+h2 { font-size: 15px; margin: 0 0 10px; font-weight: 600; }
+.sub, .muted { color: var(--muted); margin: 0; }
+.small { font-size: 13px; }
+section { margin-bottom: 20px; }
+footer { padding-top: 8px; padding-bottom: 32px; color: var(--muted); }
+
+.notice { background: var(--surface); border: 1px solid var(--warn); border-left-width: 4px; border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; }
+.notice code { background: var(--bg); padding: 1px 4px; border-radius: 4px; }
+
+/* Filters: one row above the content */
+.filters { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: end; }
+.filters label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 2px; }
+.spacer { flex: 1; }
+select, button {
+  font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px; min-height: 36px;
+}
+button { cursor: pointer; }
+button:hover, select:hover { border-color: var(--axis); }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; background: var(--surface); color: var(--ink-2); }
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+button.link { background: none; border: 0; color: var(--accent); padding: 4px 0; min-height: 0; }
+
+/* Machine cards */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.card-head h3 { font-size: 15px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status { font-size: 12px; white-space: nowrap; color: var(--ink-2); }
+.status::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; background: var(--ok); }
+.status.off::before { background: var(--warn); }
+.inlets { display: grid; grid-template-columns: auto 1fr 1fr; gap: 2px 10px; font-size: 14px; align-items: center; }
+.inlets .hdr { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.inlets .num { text-align: right; font-variant-numeric: tabular-nums; }
+.inlet { display: flex; align-items: center; gap: 6px; color: var(--ink-2); }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.card-foot { margin-top: 8px; font-size: 12px; color: var(--muted); }
+
+/* Panels, chart, tables */
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+.panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; margin-bottom: 8px; }
+.panel-head h2 { margin: 0; }
+.panel-head .link { margin-left: auto; }
+.legend { display: flex; gap: 14px; font-size: 13px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.chart { position: relative; width: 100%; min-height: 260px; }
+.chart svg { display: block; max-width: 100%; height: auto; }
+.chart .grid { stroke: var(--grid); stroke-width: 1; }
+.chart .axis { stroke: var(--axis); stroke-width: 1; }
+.chart .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.chart .hit { fill: transparent; }
+.chart .bar.active .hit { fill: var(--ink); fill-opacity: 0.05; }
+.tooltip {
+  position: absolute; pointer-events: none; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 13px;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.12); min-width: 150px;
+}
+.tip-title { font-weight: 600; margin-bottom: 4px; }
+.tip-row { display: flex; align-items: center; gap: 6px; color: var(--ink-2); }
+.tip-row b { margin-left: auto; padding-left: 12px; color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.tip-row.total { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 4px; }
+
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.empty { color: var(--muted); padding: 16px 0; }
+
+@media (max-width: 560px) {
+  .spacer { display: none; }
+  .filters label { flex: 1 1 100%; }
+  .panel { padding: 12px; }
+}

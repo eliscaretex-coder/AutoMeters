@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en-IE">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AutoMeters</title>
+  <meta name="description" content="Water usage per machine, from the AutoMeters water meter readers.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 3C11 10 7 15 7 20a9 9 0 0 0 18 0c0-5-4-10-9-17z' fill='%232a78d6'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="wrap">
+      <h1>AutoMeters</h1>
+      <p class="sub">Water usage per machine</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div id="notice" class="notice" hidden></div>
+
+    <section class="filters" aria-label="Filters">
+      <label>Machine
+        <select id="machine"><option value="">All machines</option></select>
+      </label>
+      <div class="seg" role="radiogroup" aria-label="Period">
+        <button type="button" data-days="7">7 days</button>
+        <button type="button" data-days="30" aria-pressed="true">30 days</button>
+        <button type="button" data-days="90">90 days</button>
+      </div>
+      <span class="spacer"></span>
+      <button type="button" id="refresh" class="ghost">Refresh</button>
+      <button type="button" id="export" class="ghost">Download CSV</button>
+    </section>
+
+    <section aria-labelledby="h-devices">
+      <h2 id="h-devices">Machines</h2>
+      <div id="devices" class="cards"></div>
+    </section>
+
+    <section aria-labelledby="h-daily" class="panel">
+      <div class="panel-head">
+        <h2 id="h-daily">Daily usage</h2>
+        <div id="legend" class="legend"></div>
+        <button type="button" id="toggle-table" class="link">Show as table</button>
+      </div>
+      <div id="chart" class="chart"></div>
+      <div id="daily-table" class="table-wrap" hidden></div>
+      <p id="period-total" class="muted"></p>
+    </section>
+
+    <section aria-labelledby="h-recent" class="panel">
+      <h2 id="h-recent">Latest readings</h2>
+      <div id="recent" class="table-wrap"></div>
+    </section>
+  </main>
+
+  <footer class="wrap small">
+    Updated <span id="updated">never</span> · refreshes every 5 minutes
+  </footer>
+
+  <script type="module" src="assets/app.js"></script>
+</body>
+</html>

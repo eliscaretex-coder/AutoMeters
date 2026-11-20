@@ -1,0 +1,8 @@
+# Secrets for the firmware build (see firmware/atoms3r_water_meter/secrets.example.h)
+firmware/**/secrets.h
+
+# Editors and OS
+.DS_Store
+.vscode/
+.idea/
+build/
