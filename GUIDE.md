@@ -98,13 +98,19 @@ To get back into SETUP mode later, **hold the screen (the button) for 5 seconds*
 
 ### What is stored
 
-- **readings:** one row per send: date and time, machine, running total for each inlet in litres and pulses, Wi-Fi signal, firmware, and the full message the Atom sent.
-- **devices:** one row per Atom (by MAC address) with its name and when it was last seen.
-- **reading_usage** and **daily_usage** (views): usage since the previous send, and usage per day (Irish time) per machine. The web page uses these.
+- **devices:** one row per meter reader (by MAC address): name, type (`washer`, `boiler`, `canteen`, `other`) and when it was last seen.
+- **readings:** one row per send: date and time, Wi-Fi signal, firmware, and the full message the device sent.
+- **reading_channels:** one row per meter input in each send, with its running total in litres and pulses. A washing machine has three inputs (Cold, Warm, Hot); the boiler and canteen meters have one (Water).
+- **channel_usage**, **daily_usage** and **latest_totals** (views): usage since the previous send, usage per day (Irish time) and the latest total of each input. The web page uses these.
+
+To change a meter's type or its order on the page, edit it in the Supabase Table Editor (table `devices`, columns `kind` and `sort_order`), or in SQL:
+```sql
+update devices set kind = 'boiler', sort_order = 50 where name = 'Boiler';
+```
 
 ### Web page
 
-The page in `docs/` shows each machine's totals, today's usage, a daily chart for 7/30/90 days and the latest readings. **Download CSV** gives the readings of the chosen period, ready to open in Excel. It refreshes every 5 minutes.
+The page in `docs/` shows every meter grouped by type (washing machines, boiler, canteen) with its totals and today's usage, a daily chart for 7/30/90 days (all washing machines together, or any single meter: click its card) and the latest readings. **Download CSV** gives the readings of the chosen period, one row per meter input, ready for a pivot table in Excel. It refreshes every 5 minutes.
 
 ---
 

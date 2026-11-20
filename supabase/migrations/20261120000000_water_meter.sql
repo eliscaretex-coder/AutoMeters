@@ -3,15 +3,22 @@
 --
 --  Run this once in the Supabase dashboard: SQL Editor > New query > paste > Run.
 --
+--  Data model
+--  - devices:          one row per meter reader (washing machine, boiler, canteen...).
+--  - readings:         one row per send (header: time, signal, firmware...).
+--  - reading_channels: one row per meter input in that send (e.g. Cold / Warm / Hot
+--                      on a washing machine, a single "Water" input on the boiler).
+--  Any number of devices and any channel names work without schema changes.
+--
 --  Security model
---  - The Atoms and the web page only ever use the PUBLISHABLE (anon) key.
---  - Nobody can write to the tables directly. The Atoms send readings through
---    the function public.submit_reading(), which checks a secret ingest token.
---    Tokens are stored only as SHA-256 hashes in the "private" schema, which is
---    not exposed by the API.
---  - Anyone with the publishable key can READ readings and devices (the web
---    page needs this). To make the page login-only later, change the two
---    "read" policies from "to anon, authenticated" to "to authenticated".
+--  - The devices and the web page only ever use the PUBLISHABLE (anon) key.
+--  - Nobody can write to the tables directly. Devices send readings through
+--    public.submit_reading(), which checks a secret ingest token. Tokens are
+--    stored only as SHA-256 hashes in the "private" schema, which the API
+--    does not expose.
+--  - Anyone with the publishable key can READ the data (the web page needs
+--    this). To make the page login-only later, change the "read" policies
+--    from "to anon, authenticated" to "to authenticated".
 -- =============================================================================
 
 create extension if not exists pgcrypto with schema extensions;
@@ -23,41 +30,45 @@ revoke all on schema private from public, anon, authenticated;
 -- Tables
 -- ---------------------------------------------------------------------------
 
--- One row per Atom (identified by its Wi-Fi MAC address).
 create table public.devices (
   id          bigint generated always as identity primary key,
-  mac         text not null unique,
-  machine     text not null,
+  mac         text not null unique,           -- hardware id sent by the device
+  name        text not null,                  -- e.g. "Machine 03", "Boiler"
+  kind        text not null default 'washer'  -- washer | boiler | canteen | other
+              check (kind in ('washer', 'boiler', 'canteen', 'other')),
+  sort_order  integer not null default 100,   -- order on the web page
   fw          text,
   rssi        smallint,
   last_seen   timestamptz,
   created_at  timestamptz not null default now()
 );
-comment on table public.devices is 'Water meter units (AtomS3R or later boards).';
+comment on table public.devices is 'Meter readers. kind and sort_order can be edited by hand.';
 
--- One row per send. Totals are running counters, exactly as the device keeps them.
 create table public.readings (
-  id           bigint generated always as identity primary key,
-  created_at   timestamptz not null default now(),
-  device_id    bigint not null references public.devices (id) on delete cascade,
-  machine      text not null,
-  cold_l       numeric(14, 3),
-  warm_l       numeric(14, 3),
-  hot_l        numeric(14, 3),
-  cold_pulses  bigint,
-  warm_pulses  bigint,
-  hot_pulses   bigint,
-  rssi         smallint,
-  fw           text,
-  boot_id      bigint,
-  seq          integer,
-  uptime_s     bigint,
-  payload      jsonb not null   -- everything the device sent (minus the token), for future use
+  id          bigint generated always as identity primary key,
+  created_at  timestamptz not null default now(),
+  device_id   bigint not null references public.devices (id) on delete cascade,
+  rssi        smallint,
+  fw          text,
+  boot_id     bigint,
+  seq         integer,
+  uptime_s    bigint,
+  payload     jsonb not null   -- everything the device sent (minus the token), for future use
 );
-comment on table public.readings is 'Raw readings sent by each device. Totals in litres are cumulative.';
-
 create index readings_device_time_idx on public.readings (device_id, created_at desc);
 create index readings_time_idx on public.readings (created_at desc);
+
+create table public.reading_channels (
+  reading_id  bigint not null references public.readings (id) on delete cascade,
+  device_id   bigint not null references public.devices (id) on delete cascade,
+  created_at  timestamptz not null,
+  channel     text not null,            -- "Cold", "Warm", "Hot", "Water"...
+  litres      numeric(14, 3),           -- running total, as kept by the device
+  pulses      bigint,
+  primary key (reading_id, channel)
+);
+create index reading_channels_series_idx on public.reading_channels (device_id, channel, created_at);
+comment on table public.reading_channels is 'Running totals per meter input. Usage = difference between consecutive rows.';
 
 -- Ingest tokens (hashed). Not reachable through the API.
 create table private.ingest_tokens (
@@ -74,63 +85,63 @@ create table private.ingest_tokens (
 -- ---------------------------------------------------------------------------
 alter table public.devices enable row level security;
 alter table public.readings enable row level security;
+alter table public.reading_channels enable row level security;
 
-revoke insert, update, delete, truncate on public.devices, public.readings from anon, authenticated;
-grant select on public.devices, public.readings to anon, authenticated;
+revoke insert, update, delete, truncate on public.devices, public.readings, public.reading_channels from anon, authenticated;
+grant select on public.devices, public.readings, public.reading_channels to anon, authenticated;
 
 create policy "devices are readable" on public.devices
   for select to anon, authenticated using (true);
-
 create policy "readings are readable" on public.readings
+  for select to anon, authenticated using (true);
+create policy "reading channels are readable" on public.reading_channels
   for select to anon, authenticated using (true);
 
 -- ---------------------------------------------------------------------------
 -- Views used by the web page (security_invoker: they respect RLS above)
 -- ---------------------------------------------------------------------------
 
--- Usage in litres since the previous reading of the same device.
+-- Usage in litres since the previous reading of the same device and channel.
 -- A negative difference (count adjusted or reset) is reported as null.
-create view public.reading_usage
+create view public.channel_usage
 with (security_invoker = true) as
 select
-  d.id, d.created_at, d.device_id, d.machine,
-  d.cold_l, d.warm_l, d.hot_l,
-  case when d.cold_diff >= 0 then d.cold_diff end as cold_used_l,
-  case when d.warm_diff >= 0 then d.warm_diff end as warm_used_l,
-  case when d.hot_diff  >= 0 then d.hot_diff  end as hot_used_l,
-  d.rssi, d.fw
+  d.reading_id, d.created_at, d.device_id, d.channel, d.litres, d.pulses,
+  case when d.diff >= 0 then d.diff end as used_l
 from (
-  select
-    r.*,
-    r.cold_l - lag(r.cold_l) over w as cold_diff,
-    r.warm_l - lag(r.warm_l) over w as warm_diff,
-    r.hot_l  - lag(r.hot_l)  over w as hot_diff
-  from public.readings r
-  window w as (partition by r.device_id order by r.created_at, r.id)
+  select c.*,
+         c.litres - lag(c.litres) over (partition by c.device_id, c.channel order by c.created_at, c.reading_id) as diff
+  from public.reading_channels c
 ) d;
 
--- Usage per day (Irish time) and per device.
+-- Usage per day (Irish time), device and channel.
 create view public.daily_usage
 with (security_invoker = true) as
 select
   (u.created_at at time zone 'Europe/Dublin')::date as day,
   u.device_id,
-  max(u.machine)                         as machine,
-  coalesce(sum(u.cold_used_l), 0)        as cold_l,
-  coalesce(sum(u.warm_used_l), 0)        as warm_l,
-  coalesce(sum(u.hot_used_l), 0)         as hot_l,
-  coalesce(sum(u.cold_used_l), 0)
-    + coalesce(sum(u.warm_used_l), 0)
-    + coalesce(sum(u.hot_used_l), 0)     as total_l,
-  count(*)                               as readings
-from public.reading_usage u
-group by 1, 2;
+  u.channel,
+  coalesce(sum(u.used_l), 0) as used_l,
+  max(u.litres)              as total_l,
+  count(*)                   as readings
+from public.channel_usage u
+group by 1, 2, 3;
 
-grant select on public.reading_usage, public.daily_usage to anon, authenticated;
+-- Latest running total per device and channel.
+create view public.latest_totals
+with (security_invoker = true) as
+select distinct on (c.device_id, c.channel)
+  c.device_id, c.channel, c.litres, c.pulses, c.created_at
+from public.reading_channels c
+order by c.device_id, c.channel, c.created_at desc, c.reading_id desc;
+
+grant select on public.channel_usage, public.daily_usage, public.latest_totals to anon, authenticated;
 
 -- ---------------------------------------------------------------------------
 -- Ingest function called by the devices
 --   POST /rest/v1/rpc/submit_reading   body: {"payload": { ...device JSON... }}
+--   payload: token, device (MAC), machine (name), kind (optional), fw, rssi,
+--            boot, seq, uptime_s, channels: [{name, enabled, litres, pulses}]
 -- ---------------------------------------------------------------------------
 create or replace function public.submit_reading(payload jsonb)
 returns jsonb
@@ -139,17 +150,17 @@ security definer
 set search_path = ''
 as $$
 declare
-  v_token_id  bigint;
-  v_mac       text;
-  v_machine   text;
-  v_device_id bigint;
-  v_ch        jsonb;
-  v_litres    numeric[] := array[null, null, null]::numeric[];
-  v_pulses    bigint[]  := array[null, null, null]::bigint[];
-  v_name      text;
-  v_idx       int;
+  v_token_id   bigint;
+  v_mac        text;
+  v_name       text;
+  v_kind       text;
+  v_device_id  bigint;
+  v_reading_id bigint;
+  v_now        timestamptz := now();
+  v_ch         jsonb;
+  v_channel    text;
 begin
-  if payload is null or jsonb_typeof(payload) <> 'object' or pg_column_size(payload) > 8192 then
+  if payload is null or jsonb_typeof(payload) <> 'object' or pg_column_size(payload) > 16384 then
     return jsonb_build_object('ok', false, 'error', 'payload');
   end if;
 
@@ -161,42 +172,37 @@ begin
     return jsonb_build_object('ok', false, 'error', 'token');
   end if;
 
-  v_mac := left(coalesce(nullif(trim(payload ->> 'device'), ''), 'unknown'), 32);
-  v_machine := left(coalesce(nullif(trim(payload ->> 'machine'), ''), 'unnamed'), 40);
+  v_mac  := left(coalesce(nullif(trim(payload ->> 'device'), ''), 'unknown'), 32);
+  v_name := left(coalesce(nullif(trim(payload ->> 'machine'), ''), 'unnamed'), 40);
+  v_kind := lower(coalesce(payload ->> 'kind', ''));
+  if v_kind not in ('washer', 'boiler', 'canteen', 'other') then v_kind := null; end if;
 
-  -- Channels: matched by name (Cold / Warm / Hot), falling back to position.
+  -- The kind sent by the device is only used when the device is first seen,
+  -- so a kind set by hand in the table is kept.
+  insert into public.devices as d (mac, name, kind, fw, rssi, last_seen)
+  values (v_mac, v_name, coalesce(v_kind, 'washer'), left(payload ->> 'fw', 20), (payload ->> 'rssi')::smallint, v_now)
+  on conflict (mac) do update
+    set name = excluded.name, fw = excluded.fw, rssi = excluded.rssi, last_seen = excluded.last_seen
+  returning d.id into v_device_id;
+
+  insert into public.readings (created_at, device_id, rssi, fw, boot_id, seq, uptime_s, payload)
+  values (v_now, v_device_id, (payload ->> 'rssi')::smallint, left(payload ->> 'fw', 20),
+          (payload ->> 'boot')::bigint, (payload ->> 'seq')::int, (payload ->> 'uptime_s')::bigint,
+          payload - 'token')
+  returning id into v_reading_id;
+
   if jsonb_typeof(payload -> 'channels') = 'array' then
-    for v_idx in 0 .. least(jsonb_array_length(payload -> 'channels'), 3) - 1 loop
-      v_ch := payload -> 'channels' -> v_idx;
-      v_name := lower(coalesce(v_ch ->> 'name', ''));
-      if v_name not in ('cold', 'warm', 'hot') then
-        v_name := (array['cold', 'warm', 'hot'])[v_idx + 1];
-      end if;
-      if coalesce((v_ch ->> 'enabled')::boolean, true) then
-        v_litres[array_position(array['cold', 'warm', 'hot'], v_name)] := round((v_ch ->> 'litres')::numeric, 3);
-        v_pulses[array_position(array['cold', 'warm', 'hot'], v_name)] := (v_ch ->> 'pulses')::bigint;
-      end if;
+    for v_ch in select * from jsonb_array_elements(payload -> 'channels') limit 16 loop
+      continue when not coalesce((v_ch ->> 'enabled')::boolean, true);
+      v_channel := left(coalesce(nullif(trim(v_ch ->> 'name'), ''), 'Water'), 20);
+      insert into public.reading_channels (reading_id, device_id, created_at, channel, litres, pulses)
+      values (v_reading_id, v_device_id, v_now, v_channel,
+              round((v_ch ->> 'litres')::numeric, 3), round((v_ch ->> 'pulses')::numeric)::bigint)
+      on conflict do nothing;
     end loop;
   end if;
 
-  insert into public.devices as d (mac, machine, fw, rssi, last_seen)
-  values (v_mac, v_machine, left(payload ->> 'fw', 20), (payload ->> 'rssi')::smallint, now())
-  on conflict (mac) do update
-    set machine = excluded.machine, fw = excluded.fw, rssi = excluded.rssi, last_seen = excluded.last_seen
-  returning d.id into v_device_id;
-
-  insert into public.readings (
-    device_id, machine,
-    cold_l, warm_l, hot_l, cold_pulses, warm_pulses, hot_pulses,
-    rssi, fw, boot_id, seq, uptime_s, payload)
-  values (
-    v_device_id, v_machine,
-    v_litres[1], v_litres[2], v_litres[3], v_pulses[1], v_pulses[2], v_pulses[3],
-    (payload ->> 'rssi')::smallint, left(payload ->> 'fw', 20),
-    (payload ->> 'boot')::bigint, (payload ->> 'seq')::int, (payload ->> 'uptime_s')::bigint,
-    payload - 'token');
-
-  update private.ingest_tokens set last_used = now() where id = v_token_id;
+  update private.ingest_tokens set last_used = v_now where id = v_token_id;
 
   return jsonb_build_object('ok', true);
 exception
@@ -211,7 +217,7 @@ grant execute on function public.submit_reading(jsonb) to anon, authenticated;
 -- ---------------------------------------------------------------------------
 -- Helper to create an ingest token (run from the SQL Editor only).
 --   select private.create_ingest_token('Laundry Atoms');
--- It returns the token ONCE. Type it into each Atom's settings page.
+-- It returns the token ONCE. Type it into each device's settings page.
 -- ---------------------------------------------------------------------------
 create or replace function private.create_ingest_token(p_label text)
 returns text

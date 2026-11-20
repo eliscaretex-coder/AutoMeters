@@ -13,6 +13,7 @@
   --cold: #2a78d6;
   --warm: #d18a00;
   --hot: #d6453d;
+  --water: #6d5bd0;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -31,13 +32,14 @@
     --cold: #3987e5;
     --warm: #b8870f;
     --hot: #e8606e;
+    --water: #8f80ea;
     color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
   --bg: #121211; --surface: #1a1a19; --border: #2e2e2c; --ink: #ecebe7; --ink-2: #c4c3be;
   --muted: #93928c; --grid: #262624; --axis: #44433f; --accent: #3987e5; --ok: #5cb86e;
-  --warn: #e39b4a; --cold: #3987e5; --warm: #b8870f; --hot: #e8606e; color-scheme: dark;
+  --warn: #e39b4a; --cold: #3987e5; --warm: #b8870f; --hot: #e8606e; --water: #8f80ea; color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -78,7 +80,13 @@ button.link { background: none; border: 0; color: var(--accent); padding: 4px 0;
 
 /* Machine cards */
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; cursor: pointer; }
+.card:hover { border-color: var(--axis); }
+.card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+h3.group { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 14px 0 8px; }
+h3.group:first-child { margin-top: 0; }
+.pair { display: inline-flex; align-items: center; gap: 5px; margin-right: 14px; font-variant-numeric: tabular-nums; }
 .card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
 .card-head h3 { font-size: 15px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status { font-size: 12px; white-space: nowrap; color: var(--ink-2); }

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AutoMeters</title>
-  <meta name="description" content="Water usage per machine, from the AutoMeters water meter readers.">
+  <meta name="description" content="Water usage from the AutoMeters meter readers.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 3C11 10 7 15 7 20a9 9 0 0 0 18 0c0-5-4-10-9-17z' fill='%232a78d6'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="assets/style.css">
 </head>
@@ -12,7 +12,7 @@
   <header class="top">
     <div class="wrap">
       <h1>AutoMeters</h1>
-      <p class="sub">Water usage per machine</p>
+      <p class="sub">Water usage: washing machines, boiler and canteen</p>
     </div>
   </header>
 
@@ -20,8 +20,8 @@
     <div id="notice" class="notice" hidden></div>
 
     <section class="filters" aria-label="Filters">
-      <label>Machine
-        <select id="machine"><option value="">All machines</option></select>
+      <label>Meter
+        <select id="machine"><option value="washers">All washing machines</option></select>
       </label>
       <div class="seg" role="radiogroup" aria-label="Period">
         <button type="button" data-days="7">7 days</button>
@@ -34,13 +34,13 @@
     </section>
 
     <section aria-labelledby="h-devices">
-      <h2 id="h-devices">Machines</h2>
-      <div id="devices" class="cards"></div>
+      <h2 id="h-devices">Meters</h2>
+      <div id="devices"></div>
     </section>
 
-    <section aria-labelledby="h-daily" class="panel">
+    <section aria-labelledby="daily-title" class="panel">
       <div class="panel-head">
-        <h2 id="h-daily">Daily usage</h2>
+        <h2 id="daily-title">Daily usage</h2>
         <div id="legend" class="legend"></div>
         <button type="button" id="toggle-table" class="link">Show as table</button>
       </div>

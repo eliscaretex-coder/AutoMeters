@@ -1,11 +1,12 @@
 # AutoMeters
 
-Water meter readers for washing machines. Each unit (today an M5Stack AtomS3R) counts the
-pulses of the Cold, Warm and Hot water meters, shows the totals on its screen and sends them
-to Supabase. A web page on GitHub Pages shows the readings.
+Water meter readers for a laundry: 9 washing machines (Cold, Warm and Hot inlets each), the
+boiler meter and the canteen meter (one input each). Each reader (today an M5Stack AtomS3R)
+counts the meter pulses, shows the totals on its screen and sends them to Supabase. A web page
+on GitHub Pages shows the readings.
 
 ```
-Atom (firmware/) --HTTPS--> Supabase: rpc/submit_reading --> tables readings, devices
+Atom (firmware/) --HTTPS--> Supabase: rpc/submit_reading --> devices, readings, reading_channels
                                                                    |
                     GitHub Pages (docs/) <-- read-only, publishable key
 ```
@@ -40,6 +41,9 @@ Atom (firmware/) --HTTPS--> Supabase: rpc/submit_reading --> tables readings, de
 
 ## Adding features
 
+- New meters: nothing to change in the database. A device appears on the page after its first
+  send; its inputs are whatever `channels` it sends (`[{name: "Water", litres, pulses}]` for a
+  single meter). Send `"kind": "boiler"` / `"canteen"` or set `devices.kind` by hand.
 - New data from the devices: add it to the JSON the firmware sends. `submit_reading` already
   stores the whole message in `readings.payload`, so it is kept even before it gets its own column.
 - New database changes: add a new file in `supabase/migrations/` (never edit one that was already run).

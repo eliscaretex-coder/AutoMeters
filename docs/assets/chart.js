@@ -93,11 +93,13 @@ export function renderStackedBars(container, { rows, series, formatValue, format
       const lines = series
         .map((s) => `<div class="tip-row"><span class="swatch" style="background:var(${s.cssVar})"></span>${s.label}<b>${formatValue(r[s.key] || 0)}</b></div>`)
         .join('');
-      tip.innerHTML = `<div class="tip-title">${formatDay(r.day)}</div>${lines}<div class="tip-row total">Total<b>${formatValue(totals[i])}</b></div>`;
+      tip.innerHTML = `<div class="tip-title">${formatDay(r.day)}</div>${lines}${series.length > 1 ? `<div class="tip-row total">Total<b>${formatValue(totals[i])}</b></div>` : ''}`;
       tip.hidden = false;
-      const left = Math.min(Math.max(cx - tip.offsetWidth / 2, 0), width - tip.offsetWidth);
+      // Beside the bar (right if it fits, else left), so it never hides the bar itself.
+      const right = cx + barW / 2 + 8;
+      const left = right + tip.offsetWidth <= width ? right : Math.max(0, cx - barW / 2 - 8 - tip.offsetWidth);
       tip.style.left = `${left}px`;
-      tip.style.top = `${Math.max(0, y(totals[i]) - tip.offsetHeight - 8)}px`;
+      tip.style.top = `${m.top}px`;
     };
     const hide = () => { g.classList.remove('active'); tip.hidden = true; };
     hit.addEventListener('pointerenter', show);

@@ -2,14 +2,21 @@ import { TIME_ZONE, OFFLINE_AFTER_MIN } from './config.js';
 import * as api from './api.js';
 import { renderStackedBars } from './chart.js';
 
-// Inlets, in a fixed order with fixed colors (same colors as the Atom screen).
-const INLETS = [
-  { key: 'cold', label: 'Cold', cssVar: '--cold' },
-  { key: 'warm', label: 'Warm', cssVar: '--warm' },
-  { key: 'hot', label: 'Hot', cssVar: '--hot' },
-];
+// Known meter inputs, in a fixed order with fixed colors (same as the Atom screen).
+// Any other channel name (e.g. "Water" on the boiler or canteen meter) uses --water.
+const KNOWN = { Cold: '--cold', Warm: '--warm', Hot: '--hot' };
+const ORDER = ['Cold', 'Warm', 'Hot'];
+const channelVar = (name) => KNOWN[name] || '--water';
+const sortChannels = (names) => [...names].sort((a, b) => {
+  const ia = ORDER.indexOf(a); const ib = ORDER.indexOf(b);
+  return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
+});
 
-const state = { days: 30, deviceId: '', devices: [], series: null };
+const KIND_LABEL = { washer: 'Washing machines', boiler: 'Boiler', canteen: 'Canteen', other: 'Other meters' };
+const KIND_ORDER = ['washer', 'boiler', 'canteen', 'other'];
+const ALL_WASHERS = 'washers';
+
+const state = { days: 30, selection: ALL_WASHERS, devices: [], chartArgs: null };
 const $ = (id) => document.getElementById(id);
 
 // ---------------------------------------------------------------------------
@@ -25,12 +32,9 @@ const fmtL = (v) => {
 const fmtAxis = (v) => (v >= 10000 ? `${nf1.format(v / 1000)} m³` : `${nf0.format(v)} L`);
 const dtFmt = new Intl.DateTimeFormat('en-IE', { timeZone: TIME_ZONE, day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
 const dayKey = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: TIME_ZONE }).format(d); // YYYY-MM-DD
-const fmtDay = (key, short) => {
-  const d = new Date(`${key}T12:00:00Z`);
-  return new Intl.DateTimeFormat('en-IE', short
-    ? { day: 'numeric', month: 'short', timeZone: 'UTC' }
-    : { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }).format(d);
-};
+const fmtDay = (key, short) => new Intl.DateTimeFormat('en-IE', short
+  ? { day: 'numeric', month: 'short', timeZone: 'UTC' }
+  : { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }).format(new Date(`${key}T12:00:00Z`));
 const ago = (iso) => {
   const min = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
   if (min < 1) return 'just now';
@@ -39,7 +43,7 @@ const ago = (iso) => {
   return `${Math.round(min / 1440)} days ago`;
 };
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const swatch = (i) => `<span class="swatch" style="background:var(${i.cssVar})"></span>`;
+const swatch = (name) => `<span class="swatch" style="background:var(${channelVar(name)})"></span>`;
 
 function notice(html) {
   const n = $('notice');
@@ -48,26 +52,39 @@ function notice(html) {
 }
 
 // ---------------------------------------------------------------------------
-// Data
+// Selection helpers
 // ---------------------------------------------------------------------------
-function fromDay(days) {
-  const d = new Date(Date.now() - (days - 1) * 86400000);
-  return dayKey(d);
+function selectedDevices() {
+  if (state.selection === ALL_WASHERS) return state.devices.filter((d) => d.kind === 'washer');
+  return state.devices.filter((d) => String(d.id) === state.selection);
+}
+const selectionLabel = () => (state.selection === ALL_WASHERS
+  ? 'all washing machines'
+  : selectedDevices()[0]?.name || '');
+
+function fillSelect() {
+  const sel = $('machine');
+  const groups = KIND_ORDER
+    .map((k) => [k, state.devices.filter((d) => d.kind === k)])
+    .filter(([, list]) => list.length);
+  sel.innerHTML = `<option value="${ALL_WASHERS}">All washing machines</option>` + groups.map(([k, list]) =>
+    `<optgroup label="${KIND_LABEL[k]}">${list.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join('')}</optgroup>`).join('');
+  if (![...sel.options].some((o) => o.value === state.selection)) state.selection = ALL_WASHERS;
+  sel.value = state.selection;
 }
 
-// Every day in the period, zero-filled, summed over the selected machines.
-function dailySeries(rows, days) {
+const fromDay = (days) => dayKey(new Date(Date.now() - (days - 1) * 86400000));
+
+// Every day in the period, zero-filled, summed per channel over the selected devices.
+function dailySeries(rows, days, channels) {
   const map = new Map();
   for (let i = days - 1; i >= 0; i--) {
     const key = dayKey(new Date(Date.now() - i * 86400000));
-    map.set(key, { day: key, cold: 0, warm: 0, hot: 0 });
+    map.set(key, Object.fromEntries([['day', key], ...channels.map((c) => [c, 0])]));
   }
   for (const r of rows) {
     const t = map.get(r.day);
-    if (!t) continue;
-    t.cold += Number(r.cold_l) || 0;
-    t.warm += Number(r.warm_l) || 0;
-    t.hot += Number(r.hot_l) || 0;
+    if (t && r.channel in t) t[r.channel] += Number(r.used_l) || 0;
   }
   return [...map.values()];
 }
@@ -75,68 +92,86 @@ function dailySeries(rows, days) {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
-function renderDevices(devices, latest, todayRows) {
+function renderDevices(totals, todayRows) {
   const box = $('devices');
-  if (!devices.length) {
-    box.innerHTML = '<p class="empty">No machines yet. They appear here after their first send.</p>';
+  if (!state.devices.length) {
+    box.innerHTML = '<p class="empty">No meters yet. They appear here after their first send.</p>';
     return;
   }
-  const today = new Map(todayRows.map((r) => [r.device_id, r]));
-  box.innerHTML = devices.map((d) => {
-    const r = latest.get(d.id);
-    const t = today.get(d.id);
+  const today = new Map(todayRows.map((r) => [`${r.device_id}|${r.channel}`, r.used_l]));
+  const card = (d) => {
+    const mine = totals.filter((t) => t.device_id === d.id);
+    const channels = sortChannels(mine.map((t) => t.channel));
     const offline = !d.last_seen || Date.now() - new Date(d.last_seen) > OFFLINE_AFTER_MIN * 60000;
-    const rows = INLETS.map((i) => `
-      <span class="inlet">${swatch(i)}${i.label}</span>
-      <span class="num">${fmtL(r?.[`${i.key}_l`])}</span>
-      <span class="num">${t ? fmtL(t[`${i.key}_l`]) : '0 L'}</span>`).join('');
+    const rows = channels.map((c) => `
+      <span class="inlet">${swatch(c)}${esc(c)}</span>
+      <span class="num">${fmtL(mine.find((t) => t.channel === c)?.litres)}</span>
+      <span class="num">${fmtL(today.get(`${d.id}|${c}`) ?? 0)}</span>`).join('');
     return `
-      <article class="card">
+      <article class="card${String(d.id) === state.selection ? ' selected' : ''}" data-id="${d.id}" tabindex="0" role="button" aria-label="Show ${esc(d.name)}">
         <div class="card-head">
-          <h3 title="${esc(d.machine)}">${esc(d.machine)}</h3>
+          <h3 title="${esc(d.name)}">${esc(d.name)}</h3>
           <span class="status ${offline ? 'off' : ''}">${d.last_seen ? (offline ? 'Offline · ' : '') + ago(d.last_seen) : 'never'}</span>
         </div>
         <div class="inlets">
-          <span class="hdr">Inlet</span><span class="hdr num">Meter total</span><span class="hdr num">Today</span>
-          ${rows}
+          <span class="hdr">Meter</span><span class="hdr num">Total</span><span class="hdr num">Today</span>
+          ${rows || '<span class="muted small">No readings yet</span><span></span><span></span>'}
         </div>
-        <div class="card-foot">Wi-Fi ${d.rssi ?? '–'} dBm · firmware ${esc(d.fw || '–')} · ${esc(d.mac)}</div>
+        <div class="card-foot">Wi-Fi ${d.rssi ?? '–'} dBm · firmware ${esc(d.fw || '–')}</div>
       </article>`;
-  }).join('');
+  };
+  box.innerHTML = KIND_ORDER
+    .map((k) => [k, state.devices.filter((d) => d.kind === k)])
+    .filter(([, list]) => list.length)
+    .map(([k, list]) => `<h3 class="group">${KIND_LABEL[k]}</h3><div class="cards">${list.map(card).join('')}</div>`)
+    .join('');
+  box.querySelectorAll('.card').forEach((c) => {
+    const pick = () => { state.selection = c.dataset.id; $('machine').value = state.selection; load(); };
+    c.addEventListener('click', pick);
+    c.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+  });
 }
 
-function renderDaily(series) {
-  state.series = series;
-  $('legend').innerHTML = INLETS.map((i) => `<span>${swatch(i)}${i.label}</span>`).join('');
-  renderStackedBars($('chart'), { rows: series, series: INLETS, formatValue: fmtAxis, formatDay: fmtDay });
+function renderDaily(series, channels) {
+  const seriesDef = channels.map((c) => ({ key: c, label: c, cssVar: channelVar(c) }));
+  state.chartArgs = { rows: series, series: seriesDef, formatValue: fmtAxis, formatDay: fmtDay };
+  $('daily-title').textContent = `Daily usage · ${selectionLabel()}`;
+  $('legend').innerHTML = channels.length > 1 ? channels.map((c) => `<span>${swatch(c)}${esc(c)}</span>`).join('') : '';
+  renderStackedBars($('chart'), state.chartArgs);
 
-  const sum = (k) => series.reduce((s, r) => s + r[k], 0);
-  const totals = Object.fromEntries(INLETS.map((i) => [i.key, sum(i.key)]));
-  const all = totals.cold + totals.warm + totals.hot;
-  $('period-total').textContent =
-    `Last ${state.days} days: ${fmtL(all)} in total (cold ${fmtL(totals.cold)}, warm ${fmtL(totals.warm)}, hot ${fmtL(totals.hot)}).`;
+  const sums = Object.fromEntries(channels.map((c) => [c, series.reduce((s, r) => s + r[c], 0)]));
+  const all = Object.values(sums).reduce((a, b) => a + b, 0);
+  $('period-total').textContent = `Last ${state.days} days: ${fmtL(all)}` +
+    (channels.length > 1 ? ` (${channels.map((c) => `${c.toLowerCase()} ${fmtL(sums[c])}`).join(', ')}).` : '.');
 
   $('daily-table').innerHTML = `<table>
-    <thead><tr><th>Day</th>${INLETS.map((i) => `<th class="num">${i.label}</th>`).join('')}<th class="num">Total</th></tr></thead>
-    <tbody>${[...series].reverse().map((r) => `<tr><td>${fmtDay(r.day)}</td>${INLETS.map((i) => `<td class="num">${fmtL(r[i.key])}</td>`).join('')}<td class="num">${fmtL(r.cold + r.warm + r.hot)}</td></tr>`).join('')}</tbody>
+    <thead><tr><th>Day</th>${channels.map((c) => `<th class="num">${esc(c)}</th>`).join('')}${channels.length > 1 ? '<th class="num">Total</th>' : ''}</tr></thead>
+    <tbody>${[...series].reverse().map((r) => `<tr><td>${fmtDay(r.day)}</td>${channels.map((c) => `<td class="num">${fmtL(r[c])}</td>`).join('')}${channels.length > 1 ? `<td class="num">${fmtL(channels.reduce((s, c) => s + r[c], 0))}</td>` : ''}</tr>`).join('')}</tbody>
   </table>`;
 }
 
 function renderRecent(rows) {
   if (!rows.length) {
-    $('recent').innerHTML = '<p class="empty">No readings in this period.</p>';
+    $('recent').innerHTML = '<p class="empty">No readings yet.</p>';
     return;
   }
+  const names = new Map(state.devices.map((d) => [d.id, d.name]));
+  const byReading = new Map();
+  for (const r of rows) {
+    if (!byReading.has(r.reading_id)) byReading.set(r.reading_id, { ...r, ch: [] });
+    byReading.get(r.reading_id).ch.push(r);
+  }
+  const list = [...byReading.values()].slice(0, 50);
+  const cell = (ch, field) => sortChannels(ch.map((c) => c.channel)).map((name) => {
+    const c = ch.find((x) => x.channel === name);
+    const v = c[field];
+    return `<span class="pair">${swatch(name)}${v == null ? '–' : fmtL(v)}</span>`;
+  }).join('');
   $('recent').innerHTML = `<table>
-    <thead><tr><th>Time</th><th>Machine</th>
-      ${INLETS.map((i) => `<th class="num">${i.label} total</th>`).join('')}
-      ${INLETS.map((i) => `<th class="num">${i.label} used</th>`).join('')}
-      <th class="num">Wi-Fi</th></tr></thead>
-    <tbody>${rows.map((r) => `<tr>
-      <td>${dtFmt.format(new Date(r.created_at))}</td><td>${esc(r.machine)}</td>
-      ${INLETS.map((i) => `<td class="num">${fmtL(r[`${i.key}_l`])}</td>`).join('')}
-      ${INLETS.map((i) => `<td class="num">${r[`${i.key}_used_l`] == null ? '–' : fmtL(r[`${i.key}_used_l`])}</td>`).join('')}
-      <td class="num">${r.rssi ?? '–'}</td></tr>`).join('')}</tbody>
+    <thead><tr><th>Time</th><th>Meter</th><th>Totals</th><th>Used since previous</th></tr></thead>
+    <tbody>${list.map((r) => `<tr>
+      <td>${dtFmt.format(new Date(r.created_at))}</td><td>${esc(names.get(r.device_id) || r.device_id)}</td>
+      <td>${cell(r.ch, 'litres')}</td><td>${cell(r.ch, 'used_l')}</td></tr>`).join('')}</tbody>
   </table>`;
 }
 
@@ -149,24 +184,19 @@ async function load() {
     return;
   }
   try {
-    const devices = await api.listDevices();
-    state.devices = devices;
-    const sel = $('machine');
-    const keep = sel.value;
-    sel.innerHTML = '<option value="">All machines</option>' +
-      devices.map((d) => `<option value="${d.id}">${esc(d.machine)}</option>`).join('');
-    sel.value = devices.some((d) => String(d.id) === keep) ? keep : '';
-    state.deviceId = sel.value;
-
-    const shown = state.deviceId ? devices.filter((d) => String(d.id) === state.deviceId) : devices;
-    const [latestList, daily, recent] = await Promise.all([
-      Promise.all(shown.map((d) => api.latestReading(d.id).then((r) => [d.id, r]))),
-      api.dailyUsage({ fromDay: fromDay(state.days), deviceId: state.deviceId }),
-      api.recentReadings({ deviceId: state.deviceId, limit: 50 }),
+    state.devices = await api.listDevices();
+    fillSelect();
+    const ids = selectedDevices().map((d) => d.id);
+    const allIds = state.devices.map((d) => d.id);
+    const [totals, todayRows, daily, recent] = await Promise.all([
+      api.latestTotals(allIds),
+      api.dailyUsage({ fromDay: dayKey(new Date()), ids: allIds }),
+      ids.length ? api.dailyUsage({ fromDay: fromDay(state.days), ids }) : [],
+      ids.length ? api.channelUsage({ ids, limit: 300 }) : [],
     ]);
-    const today = dayKey(new Date());
-    renderDevices(shown, new Map(latestList), daily.filter((r) => r.day === today));
-    renderDaily(dailySeries(daily, state.days));
+    const channels = sortChannels(new Set(totals.filter((t) => ids.includes(t.device_id)).map((t) => t.channel)));
+    renderDevices(totals, todayRows);
+    renderDaily(dailySeries(daily, state.days, channels), channels);
     renderRecent(recent);
     notice('');
     $('updated').textContent = dtFmt.format(new Date());
@@ -176,20 +206,27 @@ async function load() {
   }
 }
 
+// CSV in "long" format (one row per meter input), easy to pivot in Excel.
 async function exportCsv() {
   const btn = $('export');
   btn.disabled = true;
   try {
+    const devices = new Map(state.devices.map((d) => [d.id, d]));
     const since = new Date(`${fromDay(state.days)}T00:00:00Z`).toISOString();
+    const ids = selectedDevices().map((d) => d.id);
     const rows = [];
     for (let offset = 0; ; offset += 1000) {
-      const page = await api.recentReadings({ deviceId: state.deviceId, since, limit: 1000, offset });
+      const page = await api.channelUsage({ ids, since, limit: 1000, offset });
       rows.push(...page);
       if (page.length < 1000) break;
     }
-    const cols = ['created_at', 'machine', 'cold_l', 'warm_l', 'hot_l', 'cold_used_l', 'warm_used_l', 'hot_used_l', 'rssi', 'fw'];
     const cell = (v) => (v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
-    const csv = [cols.join(','), ...rows.reverse().map((r) => cols.map((c) => cell(r[c])).join(','))].join('\n');
+    const local = new Intl.DateTimeFormat('sv-SE', { timeZone: TIME_ZONE, dateStyle: 'short', timeStyle: 'medium' });
+    const lines = rows.reverse().map((r) => {
+      const d = devices.get(r.device_id) || {};
+      return [local.format(new Date(r.created_at)), d.name, d.kind, r.channel, r.litres, r.used_l].map(cell).join(',');
+    });
+    const csv = ['time,meter,kind,channel,total_l,used_l', ...lines].join('\n');
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
     a.download = `water-readings-${dayKey(new Date())}.csv`;
@@ -205,7 +242,7 @@ async function exportCsv() {
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
-$('machine').addEventListener('change', load);
+$('machine').addEventListener('change', (e) => { state.selection = e.target.value; load(); });
 $('refresh').addEventListener('click', load);
 $('export').addEventListener('click', exportCsv);
 document.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => {
@@ -222,7 +259,7 @@ $('toggle-table').addEventListener('click', (e) => {
 let resizeTimer;
 window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => { if (state.series) renderDaily(state.series); }, 200);
+  resizeTimer = setTimeout(() => { if (state.chartArgs) renderStackedBars($('chart'), state.chartArgs); }, 200);
 });
 setInterval(load, 5 * 60 * 1000);
 load();

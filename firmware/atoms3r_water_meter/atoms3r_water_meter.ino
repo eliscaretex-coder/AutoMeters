@@ -288,6 +288,7 @@ static bool doSend() {
   JsonObject p = doc["payload"].to<JsonObject>();
   p["token"] = cfg.token;
   p["machine"] = cfg.machine;
+  p["kind"] = "washer";  // washer | boiler | canteen | other (used when the device is first seen)
   p["device"] = WiFi.macAddress();
   p["fw"] = FW_VERSION;
   p["boot"] = bootId;

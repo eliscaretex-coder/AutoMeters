@@ -25,33 +25,23 @@ async function get(path, params = {}) {
   return res.json();
 }
 
+const inIds = (ids) => (ids && ids.length ? `in.(${ids.join(',')})` : undefined);
+
 export const listDevices = () =>
-  get('devices', { select: '*', order: 'machine.asc' });
+  get('devices', { select: '*', order: 'sort_order.asc,name.asc' });
 
-export async function latestReading(deviceId) {
-  const rows = await get('readings', {
-    select: 'created_at,cold_l,warm_l,hot_l,cold_pulses,warm_pulses,hot_pulses,rssi,fw',
-    device_id: `eq.${deviceId}`,
-    order: 'created_at.desc',
-    limit: 1,
-  });
-  return rows[0] || null;
-}
+export const latestTotals = (ids) =>
+  get('latest_totals', { select: '*', device_id: inIds(ids) });
 
-export const dailyUsage = ({ fromDay, deviceId }) =>
-  get('daily_usage', {
-    select: '*',
-    day: `gte.${fromDay}`,
-    device_id: deviceId ? `eq.${deviceId}` : undefined,
-    order: 'day.asc',
-  });
+export const dailyUsage = ({ fromDay, ids }) =>
+  get('daily_usage', { select: 'day,device_id,channel,used_l', day: `gte.${fromDay}`, device_id: inIds(ids), order: 'day.asc' });
 
-export const recentReadings = ({ deviceId, since, limit = 50, offset = 0 }) =>
-  get('reading_usage', {
-    select: '*',
-    device_id: deviceId ? `eq.${deviceId}` : undefined,
+export const channelUsage = ({ ids, since, limit = 300, offset = 0 }) =>
+  get('channel_usage', {
+    select: 'reading_id,created_at,device_id,channel,litres,used_l',
+    device_id: inIds(ids),
     created_at: since ? `gte.${since}` : undefined,
-    order: 'created_at.desc',
+    order: 'created_at.desc,reading_id.desc',
     limit,
     offset: offset || undefined,
   });
