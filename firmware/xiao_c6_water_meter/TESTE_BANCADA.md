@@ -1,98 +1,98 @@
-# XIAO ESP32-C6: gravar e testar na bancada
+# XIAO ESP32-C6 + Atom: gravar e testar na bancada
 
-Firmware `xiao_c6_water_meter` (versão 3.0.0-c6). Faz o mesmo que o do AtomS3R (conta os
-pulsos das 3 entradas e envia ao Supabase), mas sem tela e com **deep sleep** para durar na
-bateria. Os dados chegam na mesma página e na mesma tabela; cada XIAO aparece como um novo
-aparelho (pelo MAC).
+Como funciona:
 
-## 1. O que muda em relação ao Atom
+```
+XIAO (bateria) --ESP-NOW, sem roteador--> AtomS3R (USB, no Wi-Fi) --internet--> Supabase
+```
+
+- A **XIAO** (firmware `xiao_c6_water_meter`, versão 3.1.0-c6) conta os pulsos dormindo e, a
+  cada 15 minutos, manda os totais por **ESP-NOW** direto para o Atom. O rádio fica ligado só
+  uma fração de segundo. Ela não precisa da senha do Wi-Fi.
+- O **Atom** (firmware `atoms3r_water_meter`, versão 2.1.0) fica ligado no USB e no Wi-Fi.
+  Ele recebe as leituras das XIAO, responde a cada uma e envia tudo ao Supabase. Ele continua
+  lendo as 3 entradas da máquina onde está instalado.
+- A XIAO descobre sozinha o canal Wi-Fi do Atom e guarda esse canal. Se o roteador mudar de
+  canal, ela procura de novo.
+- As duas placas precisam da mesma **Network key** (padrão `autometers-net`). Placas com outra
+  chave são ignoradas.
+
+## 1. Ligação da XIAO
 
 | | AtomS3R | XIAO ESP32-C6 |
 |---|---|---|
 | Fria / Morna / Quente | G5 / G6 / G7 | **D0 / D1 / D2** |
 | GND | GND | GND |
-| Tela | sim | não: o **LED amarelo** pisca a cada pulso |
-| Entrar no SETUP | segurar a tela 5 s | apertar **RESET** e, enquanto o LED pisca rápido (3 s), apertar **BOOT** |
-| Energia | sempre ligado | dorme entre os pulsos; liga o Wi-Fi só para enviar |
+| Tela | sim | não: o **LED amarelo** pisca a cada pulso (nos 10 min de teste) |
+| Botões | tela | **B** (BOOT) e **R** (RESET), dos lados do USB-C |
 
-A ligação de cada medidor continua a mesma: **pino → diodo 1N4148 → terminal 2 do 7111**
-(listra do diodo do lado do 7111), e **GND da XIAO → terminal 6**.
+A ligação de cada medidor é a mesma do Atom: **pino → diodo 1N4148 → terminal 2 do 7111**
+(listra do diodo do lado do 7111) e **GND → terminal 6**.
 
-Só os pinos GPIO0 a GPIO7 conseguem acordar o C6 do deep sleep. Na XIAO isso é D0, D1, D2 e os
-pads de baixo (MTDI, MTCK, MTDO). Por isso as entradas ficaram em D0/D1/D2.
+## 2. Arduino IDE (uma vez)
 
-## 2. Preparar o Arduino IDE (uma vez)
-
-1. **File > Preferences > Additional boards manager URLs**, adicione:
+1. Em **File > Preferences > Additional boards manager URLs**:
    `https://espressif.github.io/arduino-esp32/package_esp32_index.json`
-2. **Tools > Board > Boards Manager**: procure **esp32** (da Espressif) e instale a versão 3.x.
-3. **Tools > Manage Libraries**: instale **ArduinoJson** (Benoit Blanchon), versão 7.
-4. Abra `xiao_c6_water_meter/xiao_c6_water_meter.ino`. Os três arquivos (`.ino`,
-   `supabase_roots.h`, `secrets.h`) precisam estar na mesma pasta, com o mesmo nome da pasta.
-5. Coloque o **token** no `secrets.h` (o mesmo do Atom). Assim cada XIAO nova só precisa do Wi-Fi.
+2. Em **Tools > Board > Boards Manager**, instale **esp32** (Espressif), versão 3.x ou mais nova.
+3. Em **Tools > Manage Libraries**, instale **ArduinoJson** e, para o Atom, **M5Unified**.
 
-## 3. Gravar
+## 3. Gravar o Atom (primeiro)
 
-1. Ligue a XIAO no USB-C (cabo de dados, não só de carga).
-2. **Tools > Board > esp32 > XIAO_ESP32C6**.
-3. **Tools > USB CDC On Boot > Enabled** (para ver as mensagens no Serial Monitor).
-4. **Tools > Port**: a porta que apareceu.
-5. Clique em **Upload**.
-   Se não gravar: segure **BOOT**, aperte e solte **RESET**, solte **BOOT** e tente de novo.
-6. Abra o **Serial Monitor** em **115200**.
+1. Abra `atoms3r_water_meter/atoms3r_water_meter.ino`. Na mesma pasta precisam estar
+   `secrets.h`, `supabase_roots.h` e `espnow_link.h`.
+2. Placa: a mesma de antes (AtomS3R / AtomS3), com **USB CDC On Boot: Enabled**. Clique em Upload.
+3. Ele mantém as configurações que já tinha. No Serial Monitor (115200) deve aparecer
+   `Gateway on: listening for readers on channel N`.
+4. Na página do Atom (`http://<ip-do-atom>/`) aparece a seção **Battery readers**. A opção
+   **Gateway** já vem marcada.
 
-## 4. Primeiro teste (sem nada ligado)
+## 4. Gravar a XIAO
 
-1. Depois de gravar, sem Wi-Fi salvo, ela entra sozinha no **SETUP**: o LED pisca devagar.
-2. No celular, conecte na rede **WaterMeter-XXXX**, senha `watermeter`. A página abre sozinha
+1. Abra `xiao_c6_water_meter/xiao_c6_water_meter.ino`. Na mesma pasta precisam estar
+   `secrets.h`, `supabase_roots.h` e `espnow_link.h`.
+2. **Tools > Board > esp32 > XIAO_ESP32C6** (não a ESP32C3). **USB CDC On Boot: Enabled**.
+3. Clique em Upload. Se não gravar: segure **B**, aperte e solte **R**, solte **B** e tente de novo.
+4. Abra o Serial Monitor em 115200 e aperte **R**.
+
+## 5. Configurar a XIAO (uma vez por placa)
+
+1. Na primeira vez ela entra sozinha no SETUP (LED piscando devagar). Se ela já foi configurada
+   antes, aperte **R** e, enquanto o LED pisca rápido (3 s), aperte **B**.
+2. No celular, conecte na rede **WaterMeter-XXXX** (senha `watermeter`). A página abre sozinha
    (ou abra `http://192.168.4.1`).
-3. Preencha **Machine name**, **Wi-Fi** e senha. Deixe **Power mode** em **Battery**.
-   Clique em **Save and restart**.
-4. O LED pisca rápido por 3 s e ela entra na rede. No Serial Monitor aparece o IP e, uns 20 s
-   depois, **Send OK**.
-5. Confira na página do GitHub (ou na tabela `readings` do Supabase) que o aparelho novo
-   apareceu.
+3. Preencha o **Machine name** (ex.: `Machine 02`). Em **Send readings via**, deixe
+   **Atom gateway (ESP-NOW)**. A **Network key** precisa ser igual à do Atom. Os campos de
+   Wi-Fi podem ficar como estão. Clique em **Save and restart**.
 
-## 5. Testar os pulsos
+## 6. Testar
 
-Durante os **10 minutos** depois de ligar ou apertar RESET, ela fica acordada para teste:
-
-1. Com um fio, encoste **D0 no GND** e solte. O LED pisca, e o Serial Monitor mostra
-   `Pulse Cold: 1 pulses`. Faça o mesmo com **D1** (Warm) e **D2** (Hot).
-2. Abra `http://<ip-da-xiao>/` no navegador (usuário `admin`, senha `watermeter` se você não
-   mudou). A tabela mostra os pulsos e se o contato está aberto ou fechado.
-3. Clique em **Send a reading now** e confira no Supabase.
-
-## 6. Testar o deep sleep
-
-1. Depois dos 10 minutos, o Serial Monitor mostra `Test window over: going to deep sleep` e a
-   porta USB some (isso é normal: no deep sleep o USB desliga).
-2. Encoste D0 no GND umas 5 vezes, devagar (uma por segundo). O LED **não** pisca agora, para
-   economizar.
-3. Espere o próximo envio (pelo **Send every (min)**; para o teste, ponha **2** na página antes)
-   ou aperte **RESET**. O total de Cold no Supabase / na página deve ter subido 5.
-
-Se ao apertar RESET o total voltar a um número menor, me avise: é sinal de que algo não foi
-salvo antes de dormir.
+1. Uns 3 s depois de reiniciar, a XIAO manda a primeira leitura. O Serial Monitor mostra
+   `Reading 1 -> gateway OK (ch 6, -48 dBm)`, e o LED dá **3 piscadas curtas**.
+   Uma piscada longa quer dizer que o Atom não respondeu (veja o item 8).
+2. No Atom, o Serial Monitor mostra `Reader 10:BD:A3:... (Machine 02): reading 1`. Na página
+   do Atom, a XIAO aparece na tabela **Battery readers**, e a coluna **Supabase** muda para
+   `sent hh:mm`.
+3. Encoste **D0** no GND algumas vezes (o LED pisca a cada pulso) e aperte **B** rapidinho para
+   mandar na hora. O número de pulsos na tabela do Atom deve subir.
+4. **Teste dormindo:** depois de 10 minutos ela dorme (`going to deep sleep` e a porta COM some).
+   Faça 5 pulsos em D0. Ela manda sozinha a cada 15 min. Para testar mais rápido, ponha
+   **Send every** em 1 ou 2 no SETUP. O total no Atom e no Supabase deve subir 5.
 
 ## 7. Bateria
 
-- **Bateria**: solde o vermelho no pad **BAT+** e o preto no **BAT−**, embaixo da placa.
-  Cuidado com a polaridade: invertida, queima a placa. A XIAO carrega a bateria pelo USB-C.
-- **Leitura da tensão (opcional)**: dois resistores de 1 MΩ em série entre **BAT+** e **GND**,
-  com o ponto do meio no pad **MTMS** (embaixo da placa). A tensão aparece na página
-  (`Battery: 3.95 V`) e vai no envio como `battery_v`. Sem os resistores, a página mostra
-  `no divider`, e tudo o mais funciona.
-- **Medir o consumo**: ponha o multímetro em µA, em série com o fio vermelho da bateria, com a
-  XIAO em deep sleep. O esperado é algo entre 15 e 40 µA. Se der mais de 1 mA, ela não está
-  dormindo.
-- **Se um contato ficar fechado** (ímã parado em cima do sensor), o pull-up gasta uns 70 µA a
-  mais enquanto ele estiver fechado. Isso ainda dá meses de bateria.
+- Solde o vermelho no pad **BAT+** e o preto no **BAT−**, embaixo da placa. Atenção à
+  polaridade: invertida, queima a placa.
+- Leitura da tensão (opcional): dois resistores de 1 MΩ em série entre BAT+ e GND, com o ponto
+  do meio no pad **MTMS**. A tensão aparece na tabela do Atom e vai ao Supabase como `battery_v`.
+- Consumo dormindo: multímetro em µA em série com o fio vermelho. O esperado é de 15 a 40 µA.
 
-## 8. Dicas
+## 8. Se a XIAO não achar o Atom
 
-- **Instalação com fonte USB**: mude **Power mode** para **Always on**. Ela não dorme, e a
-  página fica sempre disponível. Segure BOOT 5 s para entrar no SETUP.
-- **Antena**: o firmware usa a antena interna. Se o sinal ficar fraco dentro da máquina, a
-  XIAO tem um conector U.FL para antena externa; é só me avisar que eu mudo uma linha.
-- **Litros por pulso** e o **ajuste para o número do 7111** funcionam como no Atom, pela página.
+- Confira se o Atom está no Wi-Fi e se mostrou `Gateway on`.
+- Confira se a **Network key** é igual nas duas. Na página do Atom aparece
+  "N with a different network key" quando chega leitura com outra chave.
+- **Alcance:** o ESP-NOW tem o alcance de um Wi-Fi comum. Teste com as placas perto e depois
+  vá afastando. Caixa metálica e paredes grossas reduzem muito o sinal. Se uma máquina ficar
+  longe, a XIAO tem um conector U.FL para antena externa.
+- Para voltar ao modo antigo (XIAO enviando direto pela internet), escolha **Wi-Fi straight to
+  Supabase** no SETUP e preencha o Wi-Fi.
