@@ -10,6 +10,15 @@
 //  - Afterwards: hold the button (the screen) for 5 s to enter SETUP.
 //  - When on Wi-Fi, the page is also at http://<atom-ip>/
 //    (user "admin" + the password chosen in the settings).
+//
+//  By default the Atom is only the gateway (no meters wired to it): the
+//  screen lists the readers. Tick "This Atom also reads a machine" on the
+//  settings page to count its own 3 inlets as well.
+//
+//  Gateway: the Atom listens for the battery meter readers (XIAO
+//  ESP32-C6) over ESP-NOW, answers them and forwards their readings to
+//  Supabase. The readers find the Atom's Wi-Fi channel by themselves; both
+//  sides need the same "Network key".
 // =============================================================================
 #include <M5Unified.h>
 #include <WiFi.h>
@@ -22,9 +31,13 @@
 #include <esp_timer.h>
 #include <driver/gpio.h>
 #include <time.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_idf_version.h>
+#include <freertos/queue.h>
 #include "supabase_roots.h"
 
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "2.2.0"
 
 // ----------------------------------------------------------------------------
 // Supabase project, publishable key and ingest token
@@ -35,6 +48,7 @@
 #if __has_include("secrets.h")
 #include "secrets.h"
 #endif
+#include "espnow_link.h"   // after secrets.h, which may set MESH_KEY
 #ifndef SUPABASE_URL
 #define SUPABASE_URL "https://obdltdjykzrxxpozupqt.supabase.co"
 #endif
@@ -92,6 +106,9 @@ struct Config {
   uint16_t intervalMin;
   uint16_t debounceMs;
   uint16_t screenOffS;  // screen turns off after this many seconds (0 = always on)
+  bool gateway;         // receive readings from the XIAO readers (ESP-NOW)
+  bool ownMeter;        // this Atom also reads a machine (its own 3 inlets)
+  String meshKey;       // ESP-NOW network key, same as on the readers
   ChannelCfg ch[NUM_CH];
 } cfg;
 
@@ -115,6 +132,11 @@ static void loadConfig() {
   cfg.intervalMin = prefs.getUShort("int", 60);
   cfg.debounceMs = prefs.getUShort("deb", 30);
   cfg.screenOffS = prefs.getUShort("scr", 60);
+  cfg.gateway = prefs.getBool("gw", true);
+  cfg.ownMeter = prefs.getBool("own", false);
+  if (!cfg.ownMeter) cfg.gateway = true;  // nothing else to do
+  cfg.meshKey = prefs.getString("mkey", "");
+  if (cfg.meshKey.isEmpty()) cfg.meshKey = MESH_KEY;
   for (int i = 0; i < NUM_CH; i++) {
     char k[8];
     snprintf(k, sizeof k, "c%den", i);  cfg.ch[i].enabled = prefs.getBool(k, true);
@@ -140,6 +162,9 @@ static void saveConfig() {
   prefs.putUShort("int", cfg.intervalMin);
   prefs.putUShort("deb", cfg.debounceMs);
   prefs.putUShort("scr", cfg.screenOffS);
+  prefs.putBool("gw", cfg.gateway);
+  prefs.putBool("own", cfg.ownMeter);
+  prefs.putString("mkey", cfg.meshKey);
   for (int i = 0; i < NUM_CH; i++) {
     char k[8];
     snprintf(k, sizeof k, "c%den", i);  prefs.putBool(k, cfg.ch[i].enabled);
@@ -238,7 +263,7 @@ static void setupCounting() {
   g_debounce = cfg.debounceMs;
   for (int i = 0; i < NUM_CH; i++) {
     ChState &c = st[i];
-    c.en = cfg.ch[i].enabled && pinAllowed(cfg.ch[i].pin);
+    c.en = cfg.ownMeter && cfg.ch[i].enabled && pinAllowed(cfg.ch[i].pin);
     c.pin = (gpio_num_t)cfg.ch[i].pin;
     c.run = 0;
     c.lastPulseMs = 0;
@@ -279,11 +304,47 @@ static String clockStr(time_t t) {
   return twoDigits(tmv.tm_hour) + ":" + twoDigits(tmv.tm_min);
 }
 
-static bool doSend() {
-  if (cfg.url.isEmpty()) { lastSendMsg = "no URL"; return false; }
-  if (cfg.key.isEmpty()) { lastSendMsg = "no API key"; return false; }
-  if (cfg.token.isEmpty()) { lastSendMsg = "no token"; return false; }
+// POST one {"payload": {...}} to submit_reading. msg gets a short result.
+static bool postReading(JsonDocument &doc, String &msg) {
+  if (cfg.url.isEmpty()) { msg = "no URL"; return false; }
+  if (cfg.key.isEmpty()) { msg = "no API key"; return false; }
+  if (cfg.token.isEmpty()) { msg = "no token"; return false; }
+  doc["payload"]["token"] = cfg.token;
+  String body;
+  serializeJson(doc, body);
 
+  String url = cfg.url;
+  while (url.endsWith("/")) url.remove(url.length() - 1);
+  url += RPC_PATH;
+
+  WiFiClientSecure client;
+  client.setCACert(SUPABASE_ROOT_CAS);
+  HTTPClient http;
+  http.setTimeout(20000);
+  if (!http.begin(client, url)) { msg = "bad URL"; return false; }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", cfg.key);
+  // Legacy anon keys are JWTs and also go in Authorization. New sb_publishable_
+  // keys must only go in the apikey header.
+  if (cfg.key.startsWith("eyJ")) http.addHeader("Authorization", "Bearer " + cfg.key);
+  int code = http.POST(body);
+  String resp = code > 0 ? http.getString() : String();
+  http.end();
+
+  bool ok = code == 200 && (resp.indexOf("\"ok\":true") >= 0 || resp.indexOf("\"ok\": true") >= 0);
+  if (ok) {
+    msg = "sent " + clockStr(time(nullptr));
+  } else {
+    if (resp.indexOf("\"token\"") >= 0) msg = "wrong token";
+    else if (code == 401) msg = "wrong API key";
+    else if (code == 404) msg = "run SQL setup";
+    else msg = "error " + String(code);
+    Serial.printf("Send failed: HTTP %d %s\n", code, resp.substring(0, 200).c_str());
+  }
+  return ok;
+}
+
+static bool doSend() {
   JsonDocument doc;
   JsonObject p = doc["payload"].to<JsonObject>();
   p["token"] = cfg.token;
@@ -304,41 +365,193 @@ static bool doSend() {
     o["lpp"] = cfg.ch[i].lpp;
     o["litres"] = litres(i);
   }
-  String body;
-  serializeJson(doc, body);
-
-  String url = cfg.url;
-  while (url.endsWith("/")) url.remove(url.length() - 1);
-  url += RPC_PATH;
-
-  WiFiClientSecure client;
-  client.setCACert(SUPABASE_ROOT_CAS);
-  HTTPClient http;
-  http.setTimeout(20000);
-  if (!http.begin(client, url)) { lastSendMsg = "bad URL"; return false; }
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", cfg.key);
-  // Legacy anon keys are JWTs and also go in Authorization. New sb_publishable_
-  // keys must only go in the apikey header.
-  if (cfg.key.startsWith("eyJ")) http.addHeader("Authorization", "Bearer " + cfg.key);
-  int code = http.POST(body);
-  String resp = code > 0 ? http.getString() : String();
-  http.end();
-
-  bool ok = code == 200 && (resp.indexOf("\"ok\":true") >= 0 || resp.indexOf("\"ok\": true") >= 0);
-  if (ok) {
-    lastSendOk = true;
-    lastSendOkAt = time(nullptr);
-    lastSendMsg = "sent " + clockStr(lastSendOkAt);
-  } else {
-    lastSendOk = false;
-    if (resp.indexOf("\"token\"") >= 0) lastSendMsg = "wrong token";
-    else if (code == 401) lastSendMsg = "wrong API key";
-    else if (code == 404) lastSendMsg = "run SQL setup";
-    else lastSendMsg = "error " + String(code);
-    Serial.printf("Send failed: HTTP %d %s\n", code, resp.substring(0, 200).c_str());
-  }
+  bool ok = postReading(doc, lastSendMsg);
+  lastSendOk = ok;
+  if (ok) lastSendOkAt = time(nullptr);
   return ok;
+}
+
+// ----------------------------------------------------------------------------
+// Gateway: readings from the XIAO readers over ESP-NOW
+// ----------------------------------------------------------------------------
+struct NodeInfo {
+  bool used;
+  uint8_t mac[6];
+  char machine[33];
+  uint32_t boot, seq;
+  uint32_t lastSeenMs;
+  int8_t rssi;
+  uint16_t battMv;
+  uint8_t nch;
+  uint8_t enabled[LINK_MAX_CH];
+  uint64_t pulses[LINK_MAX_CH];
+  float lpp[LINK_MAX_CH];
+  char status[24];
+};
+
+static const int MAX_NODES = 24;
+static NodeInfo nodes[MAX_NODES];
+static portMUX_TYPE nodesMux = portMUX_INITIALIZER_UNLOCKED;
+static QueueHandle_t rxQueue = nullptr;   // radio -> gateway task
+static QueueHandle_t upQueue = nullptr;   // gateway task -> sender task
+static bool gatewayRunning = false;
+static uint32_t gwReceived = 0, gwBadKey = 0;  // only written by the gateway task
+
+static String macStr(const uint8_t *m) {
+  char b[18];
+  snprintf(b, sizeof b, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+  return b;
+}
+
+#if ESP_IDF_VERSION_MAJOR >= 5
+static void onLinkRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  const uint8_t *mac = info->src_addr;
+  int8_t rssi = info->rx_ctrl ? info->rx_ctrl->rssi : 0;
+#else
+static void onLinkRecv(const uint8_t *mac, const uint8_t *data, int len) {
+  int8_t rssi = 0;
+#endif
+  if (len != (int)sizeof(LinkReading) || !rxQueue) return;
+  RxItem it;
+  memcpy(it.mac, mac, 6);
+  it.rssi = rssi;
+  memcpy(&it.r, data, sizeof it.r);
+  if (it.r.magic != LINK_MAGIC || it.r.version != LINK_VERSION || it.r.type != LINK_READING) return;
+  xQueueSend(rxQueue, &it, 0);
+}
+
+static void sendAck(const RxItem &it) {
+  LinkAck a;
+  memset(&a, 0, sizeof a);
+  a.magic = LINK_MAGIC;
+  a.version = LINK_VERSION;
+  a.type = LINK_ACK;
+  a.boot = it.r.boot;
+  a.seq = it.r.seq;
+  a.channel = (uint8_t)WiFi.channel();
+  a.rssi = it.rssi;
+  memcpy(a.dest, it.mac, 6);
+  a.tag = link_tag(cfg.meshKey.c_str(), &a, sizeof a);
+  esp_now_peer_info_t peer;
+  memset(&peer, 0, sizeof peer);
+  memcpy(peer.peer_addr, it.mac, 6);
+  peer.channel = 0;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+  bool added = esp_now_add_peer(&peer) == ESP_OK;
+  esp_now_send(it.mac, (const uint8_t *)&a, sizeof a);
+  if (added) {
+    delay(5);
+    esp_now_del_peer(it.mac);
+  }
+}
+
+static void gatewayTask(void *) {
+  RxItem it;
+  for (;;) {
+    if (xQueueReceive(rxQueue, &it, portMAX_DELAY) != pdTRUE) continue;
+    if (it.r.tag != link_tag(cfg.meshKey.c_str(), &it.r, sizeof it.r)) { gwBadKey++; continue; }
+    it.r.machine[sizeof it.r.machine - 1] = 0;
+    it.r.kind[sizeof it.r.kind - 1] = 0;
+    it.r.fw[sizeof it.r.fw - 1] = 0;
+    if (it.r.nch > LINK_MAX_CH) it.r.nch = LINK_MAX_CH;
+    sendAck(it);  // answer first: the reader waits only ~120 ms
+    gwReceived++;
+
+    bool isNew = true;
+    portENTER_CRITICAL(&nodesMux);
+    int idx = -1, freeIdx = -1, oldest = 0;
+    for (int i = 0; i < MAX_NODES; i++) {
+      if (nodes[i].used && memcmp(nodes[i].mac, it.mac, 6) == 0) { idx = i; break; }
+      if (!nodes[i].used && freeIdx < 0) freeIdx = i;
+      if (nodes[i].lastSeenMs < nodes[oldest].lastSeenMs) oldest = i;
+    }
+    if (idx < 0) { idx = freeIdx >= 0 ? freeIdx : oldest; memset(&nodes[idx], 0, sizeof nodes[idx]); }
+    NodeInfo &n = nodes[idx];
+    // The same reading again (our answer got lost): answer, but do not upload twice
+    if (n.used && n.boot == it.r.boot && it.r.seq <= n.seq) isNew = false;
+    n.used = true;
+    memcpy(n.mac, it.mac, 6);
+    strncpy(n.machine, it.r.machine, sizeof n.machine);
+    n.boot = it.r.boot;
+    if (isNew) n.seq = it.r.seq;
+    n.lastSeenMs = millis();
+    n.rssi = it.rssi;
+    n.battMv = it.r.battery_mv;
+    n.nch = it.r.nch;
+    for (int c = 0; c < n.nch; c++) {
+      n.enabled[c] = it.r.ch[c].enabled;
+      n.pulses[c] = it.r.ch[c].pulses;
+      n.lpp[c] = it.r.ch[c].lpp;
+    }
+    if (isNew) strncpy(n.status, "queued", sizeof n.status);
+    portEXIT_CRITICAL(&nodesMux);
+
+    if (isNew && xQueueSend(upQueue, &it, 0) != pdTRUE) {
+      RxItem dropped;  // queue full: drop the oldest, the totals are in the next reading anyway
+      xQueueReceive(upQueue, &dropped, 0);
+      xQueueSend(upQueue, &it, 0);
+    }
+    Serial.printf("Reader %s (%s): reading %lu, %d dBm%s\n", macStr(it.mac).c_str(), it.r.machine,
+                  (unsigned long)it.r.seq, it.rssi, isNew ? "" : " (repeat)");
+  }
+}
+
+static void setNodeStatus(const uint8_t *mac, const String &msg) {
+  portENTER_CRITICAL(&nodesMux);
+  for (int i = 0; i < MAX_NODES; i++)
+    if (nodes[i].used && memcmp(nodes[i].mac, mac, 6) == 0) strncpy(nodes[i].status, msg.c_str(), sizeof nodes[i].status - 1);
+  portEXIT_CRITICAL(&nodesMux);
+}
+
+// Called by the sender task: upload what the readers sent
+static void uploadNodeReadings() {
+  if (!upQueue) return;
+  RxItem it;
+  while (WiFi.status() == WL_CONNECTED && xQueueReceive(upQueue, &it, 0) == pdTRUE) {
+    JsonDocument doc;
+    JsonObject p = doc["payload"].to<JsonObject>();
+    p["machine"] = it.r.machine;
+    p["kind"] = it.r.kind;
+    p["device"] = macStr(it.mac);
+    p["fw"] = it.r.fw;
+    p["board"] = "xiao-esp32c6";
+    p["boot"] = it.r.boot;
+    p["seq"] = it.r.seq;
+    p["uptime_s"] = it.r.uptime_s;
+    p["rssi"] = it.rssi;
+    p["wakes"] = it.r.wakes;
+    if (it.r.battery_mv > 2000) p["battery_v"] = serialized(String(it.r.battery_mv / 1000.0f, 2));
+    p["power"] = it.r.power ? "always_on" : "battery";
+    p["link"] = "espnow";
+    p["via"] = WiFi.macAddress();
+    JsonArray arr = p["channels"].to<JsonArray>();
+    for (int c = 0; c < it.r.nch; c++) {
+      JsonObject o = arr.add<JsonObject>();
+      char name[9] = {0};
+      memcpy(name, it.r.ch[c].name, 8);
+      o["name"] = name;
+      o["enabled"] = it.r.ch[c].enabled != 0;
+      o["pulses"] = (unsigned long long)it.r.ch[c].pulses;
+      o["lpp"] = it.r.ch[c].lpp;
+      o["litres"] = (double)it.r.ch[c].pulses * (double)it.r.ch[c].lpp;
+    }
+    String msg;
+    postReading(doc, msg);
+    setNodeStatus(it.mac, msg);
+  }
+}
+
+static void startGateway() {
+  if (gatewayRunning || !cfg.gateway) return;
+  WiFi.setSleep(false);  // keep the radio listening for the readers
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW init failed"); return; }
+  rxQueue = xQueueCreate(16, sizeof(RxItem));
+  upQueue = xQueueCreate(24, sizeof(RxItem));
+  esp_now_register_recv_cb(onLinkRecv);
+  xTaskCreatePinnedToCore(gatewayTask, "gateway", 6144, nullptr, 5, nullptr, 0);
+  gatewayRunning = true;
+  Serial.printf("Gateway on: listening for readers on channel %d\n", (int)WiFi.channel());
 }
 
 static void sendTask(void *) {
@@ -355,8 +568,9 @@ static void sendTask(void *) {
         sendRequested = false;
         firstDone = true;
         lastAttempt = millis();
-        doSend();
+        if (cfg.ownMeter) doSend();
       }
+      uploadNodeReadings();
     } else {
       connectedAt = 0;
     }
@@ -415,14 +629,50 @@ static void handleRoot() {
   h += "<div class='muted'>Firmware " FW_VERSION " &middot; " + WiFi.macAddress() + "</div>";
 
   // Current status
-  h += "<h2>Current readings</h2><table><tr><th>Inlet</th><th>Pulses</th><th>Litres</th></tr>";
-  for (int i = 0; i < NUM_CH; i++) {
-    h += "<tr><td>" + String(CH_NAMES[i]) + (st[i].en ? "" : " (off)") + "</td><td>" +
-         String((unsigned long long)getPulses(i)) + "</td><td>" + String(litres(i), 1) + "</td></tr>";
+  if (cfg.ownMeter) {
+    h += "<h2>Current readings</h2><table><tr><th>Inlet</th><th>Pulses</th><th>Litres</th></tr>";
+    for (int i = 0; i < NUM_CH; i++) {
+      h += "<tr><td>" + String(CH_NAMES[i]) + (st[i].en ? "" : " (off)") + "</td><td>" +
+           String((unsigned long long)getPulses(i)) + "</td><td>" + String(litres(i), 1) + "</td></tr>";
+    }
+    h += "</table>";
   }
-  h += "</table><div class='muted'>Wi-Fi: " +
+  h += "<div class='muted'>Wi-Fi: " +
        (WiFi.status() == WL_CONNECTED ? esc(WiFi.SSID()) + " (" + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)" : String("not connected")) +
        " &middot; last send: " + esc(lastSendMsg) + "</div>";
+
+  // Readers heard over ESP-NOW
+  if (cfg.gateway) {
+    h += "<h2>Battery readers</h2>";
+    if (!gatewayRunning) h += "<div class='muted'>Starts when the Atom is on the Wi-Fi.</div>";
+    else h += "<div class='muted'>Listening on channel " + String(WiFi.channel()) + " &middot; " + String(gwReceived) + " readings received" +
+              (gwBadKey ? " &middot; " + String(gwBadKey) + " with a different network key" : String("")) + "</div>";
+    h += "<table><tr><th>Reader</th><th>Last heard</th><th>Signal</th><th>Battery</th><th>Pulses</th><th>Supabase</th></tr>";
+    int shown = 0;
+    for (int i = 0; i < MAX_NODES; i++) {
+      NodeInfo n;
+      portENTER_CRITICAL(&nodesMux);
+      n = nodes[i];
+      portEXIT_CRITICAL(&nodesMux);
+      if (!n.used) continue;
+      shown++;
+      uint32_t ago = (millis() - n.lastSeenMs) / 1000;
+      String pulses;
+      for (int c = 0; c < n.nch; c++) {
+        if (!n.enabled[c]) continue;
+        if (pulses.length()) pulses += " / ";
+        pulses += String((unsigned long long)n.pulses[c]);
+      }
+      char machine[34];
+      strncpy(machine, n.machine, sizeof machine);
+      machine[33] = 0;
+      h += "<tr><td>" + esc(machine) + "<br><span class='muted'>" + macStr(n.mac) + "</span></td><td>" +
+           (ago < 120 ? String(ago) + " s ago" : String(ago / 60) + " min ago") + "</td><td>" + String(n.rssi) + " dBm</td><td>" +
+           (n.battMv > 2000 ? String(n.battMv / 1000.0f, 2) + " V" : String("-")) + "</td><td>" + pulses + "</td><td>" + esc(String(n.status)) + "</td></tr>";
+    }
+    if (!shown) h += "<tr><td colspan='6' class='muted'>None yet. Press BOOT on a reader to make it send.</td></tr>";
+    h += "</table>";
+  }
 
   // Main form
   h += "<form method='post' action='/save'>";
@@ -439,13 +689,16 @@ static void handleRoot() {
   h += "<div class='row'><div><label>Send every (min)</label><input name='int' type='number' min='1' max='1440' value='" + String(cfg.intervalMin) + "'></div>";
   h += "<div><label>Debounce filter (ms)</label><input name='deb' type='number' min='2' max='500' value='" + String(cfg.debounceMs) + "'></div></div>";
   h += "<label>Screen off after (seconds, 0 = always on)</label><input name='scr' type='number' min='0' max='3600' value='" + String(cfg.screenOffS) + "'>";
+  h += "<label><input type='checkbox' name='own' value='1'" + String(cfg.ownMeter ? " checked" : "") + "> This Atom also reads a machine (its own inlets, settings below)</label>";
+  h += "<label><input type='checkbox' name='gw' value='1'" + String(cfg.gateway ? " checked" : "") + "> Gateway: receive the battery readers (XIAO) and send their readings</label>";
+  h += "<label>Network key (the same on every XIAO reader)</label><input name='mkey' maxlength='32' value='" + esc(cfg.meshKey) + "'>";
   h += "<label>Time zone (POSIX)</label><input name='tz' value='" + esc(cfg.tz) + "'>";
   h += "<div class='muted'>Ireland: GMT0IST,M3.5.0/1,M10.5.0</div>";
   h += "<label>Password for this page, user admin (blank = keep)</label><input name='adm' type='password'>";
   h += "</fieldset>";
 
-  h += "<h2>Water inlets</h2>";
-  for (int i = 0; i < NUM_CH; i++) {
+  if (cfg.ownMeter) h += "<h2>Water inlets</h2>";
+  for (int i = 0; i < NUM_CH && cfg.ownMeter; i++) {
     String p = "c" + String(i);
     h += "<fieldset><legend>" + String(CH_NAMES[i]) + "</legend>";
     h += "<label><input type='checkbox' name='" + p + "en' value='1'" + (cfg.ch[i].enabled ? " checked" : "") + "> Inlet in use</label>";
@@ -462,6 +715,7 @@ static void handleRoot() {
   h += "<button type='submit'>Save and restart</button></form>";
 
   // Count adjustment
+  if (cfg.ownMeter) {
   h += "<h2>Match the count to the 7111</h2><form method='post' action='/counts'><fieldset><legend>Current pulses</legend>";
   h += "<div class='muted'>Type the number shown on each 7111 counter. Blank = leave as is.</div>";
   for (int i = 0; i < NUM_CH; i++) {
@@ -470,6 +724,7 @@ static void handleRoot() {
   h += "</fieldset><button type='submit'>Save count</button></form>";
 
   h += "<h2>Test</h2><form method='post' action='/send'><button type='submit'>Send a reading now</button></form>";
+  }
   if (configMode) h += "<form method='post' action='/exit'><button type='submit' style='background:#55606b'>Leave SETUP mode</button></form>";
   h += "</body></html>";
   server.send(200, "text/html; charset=utf-8", h);
@@ -496,12 +751,18 @@ static void handleSave() {
   n.intervalMin = constrain(server.arg("int").toInt(), 1, 1440);
   n.debounceMs = constrain(server.arg("deb").toInt(), 2, 500);
   n.screenOffS = constrain(server.arg("scr").toInt(), 0, 3600);
+  n.gateway = server.hasArg("gw");
+  n.ownMeter = server.hasArg("own");
+  if (!n.ownMeter) n.gateway = true;
+  n.meshKey = server.arg("mkey"); n.meshKey.trim();
+  if (n.meshKey.isEmpty()) n.meshKey = MESH_KEY;
   n.tz = server.arg("tz"); n.tz.trim();
   if (n.tz.isEmpty()) n.tz = "GMT0";
   if (server.arg("adm").length()) n.adminPass = server.arg("adm");
 
   String err;
-  for (int i = 0; i < NUM_CH; i++) {
+  // The inlet fields are only on the page when this Atom reads a machine
+  for (int i = 0; i < NUM_CH && server.hasArg("c0lpp"); i++) {
     String p = "c" + String(i);
     n.ch[i].enabled = server.hasArg(p + "en");
     n.ch[i].pin = (uint8_t)server.arg(p + "pin").toInt();
@@ -510,7 +771,7 @@ static void handleSave() {
     if (!pinAllowed(n.ch[i].pin)) err += "Invalid pin for " + String(CH_NAMES[i]) + ". ";
     if (n.ch[i].lpp <= 0) err += "Invalid litres per pulse for " + String(CH_NAMES[i]) + ". ";
   }
-  for (int i = 0; i < NUM_CH; i++)
+  for (int i = 0; i < NUM_CH && n.ownMeter; i++)
     for (int j = i + 1; j < NUM_CH; j++)
       if (n.ch[i].enabled && n.ch[j].enabled && n.ch[i].pin == n.ch[j].pin)
         err += String(CH_NAMES[i]) + " and " + CH_NAMES[j] + " are on the same pin. ";
@@ -581,7 +842,121 @@ static String fmtLitres(double l) {
   return String(l / 1000.0, 1) + " m3";
 }
 
+// Gateway-only screen. Page 0: one row per reader (most recent first).
+// Tap the screen: next page = one machine with its Cold / Warm / Hot litres.
+static int gwPage = 0;
+
+static void drawGateway() {
+  NodeInfo list[MAX_NODES];
+  int n = 0;
+  portENTER_CRITICAL(&nodesMux);
+  for (int i = 0; i < MAX_NODES; i++) if (nodes[i].used) list[n++] = nodes[i];
+  portEXIT_CRITICAL(&nodesMux);
+  // Pages in a stable order: by machine name
+  for (int a = 0; a < n; a++)
+    for (int b = a + 1; b < n; b++)
+      if (strncmp(list[b].machine, list[a].machine, sizeof list[a].machine) < 0) { NodeInfo t = list[a]; list[a] = list[b]; list[b] = t; }
+  if (gwPage > n) gwPage = 0;
+
+  canvas.fillScreen(TFT_BLACK);
+  canvas.setTextDatum(TL_DATUM);
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextColor(TFT_WHITE);
+
+  if (gwPage == 0) {
+    // ---- list of machines
+    canvas.drawString("Machines", 2, 0);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.setTextColor(0x8410);
+    canvas.drawString(String(n), 126, 0);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.drawFastHLine(0, 17, 128, 0x4208);
+    canvas.setFont(&fonts::Font0);
+    if (n == 0) {
+      canvas.setTextColor(0x8410);
+      canvas.drawString("No readers yet.", 2, 30);
+      canvas.drawString("Press BOOT on a", 2, 46);
+      canvas.drawString("XIAO to send.", 2, 58);
+    }
+    for (int i = 0; i < n && i < 6; i++) {
+      int y = 21 + i * 15;
+      uint32_t ago = (millis() - list[i].lastSeenMs) / 60000;
+      bool late = ago > 2UL * cfg.intervalMin + 5;
+      char name[34];
+      strncpy(name, list[i].machine, sizeof name);
+      name[33] = 0;
+      double total = 0;
+      for (int c = 0; c < list[i].nch; c++)
+        if (list[i].enabled[c]) total += (double)list[i].pulses[c] * list[i].lpp[c];
+      String right = fmtLitres(total);
+      String nm = name;
+      canvas.setTextColor(late ? TFT_ORANGE : TFT_WHITE);
+      while (nm.length() > 1 && canvas.textWidth(nm) + canvas.textWidth(right) > 118) nm.remove(nm.length() - 1);
+      canvas.drawString(nm, 2, y);
+      canvas.setTextDatum(TR_DATUM);
+      canvas.setTextColor(late ? TFT_ORANGE : 0xAD55);
+      canvas.drawString(right, 126, y);
+      canvas.setTextDatum(TL_DATUM);
+    }
+    if (n > 6) { canvas.setTextColor(0x8410); canvas.drawString("+" + String(n - 6) + " more, tap", 2, 21 + 6 * 15); }
+  } else {
+    // ---- one machine
+    const NodeInfo &m = list[gwPage - 1];
+    char name[34];
+    strncpy(name, m.machine, sizeof name);
+    name[33] = 0;
+    String title = name;
+    while (title.length() > 1 && canvas.textWidth(title) > 100) title.remove(title.length() - 1);
+    canvas.drawString(title, 2, 0);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.setTextColor(0x8410);
+    canvas.drawString(String(gwPage) + "/" + String(n), 126, 0);
+    canvas.drawFastHLine(0, 17, 128, 0x4208);
+    for (int c = 0; c < NUM_CH; c++) {
+      int y = 21 + c * 30;
+      bool en = c < m.nch && m.enabled[c];
+      canvas.fillRoundRect(0, y, 18, 26, 3, en ? chColor[c] : 0x4208);
+      canvas.setFont(&fonts::Font2);
+      canvas.setTextColor(TFT_BLACK);
+      canvas.setTextDatum(MC_DATUM);
+      canvas.drawString(CH_SHORT[c], 9, y + 13);
+      canvas.setTextDatum(MR_DATUM);
+      if (!en) { canvas.setTextColor(0x8410); canvas.drawString("off", 126, y + 13); continue; }
+      String v = showPulses ? String((unsigned long long)m.pulses[c]) : fmtLitres((double)m.pulses[c] * m.lpp[c]);
+      canvas.setFont(&fonts::Font4);
+      if (canvas.textWidth(v) > 104) canvas.setFont(&fonts::Font2);
+      canvas.setTextColor(TFT_WHITE);
+      canvas.drawString(v, 126, y + 14);
+    }
+    canvas.setTextDatum(TL_DATUM);
+    canvas.drawFastHLine(0, 112, 128, 0x4208);
+    canvas.setFont(&fonts::Font0);
+    uint32_t ago = (millis() - m.lastSeenMs) / 60000;
+    String foot = ago < 60 ? String(ago) + " min ago" : String(ago / 60) + " h ago";
+    canvas.setTextColor(ago > 2UL * cfg.intervalMin + 5 ? TFT_ORANGE : TFT_GREENYELLOW);
+    canvas.drawString(foot, 2, 117);
+    canvas.setTextColor(0x8410);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.drawString(m.battMv > 2000 ? String(m.battMv / 1000.0f, 2) + " V" : String(m.rssi) + " dBm", 126, 117);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.pushSprite(0, 0);
+    return;
+  }
+
+  // footer for the list page
+  canvas.setFont(&fonts::Font0);
+  canvas.drawFastHLine(0, 112, 128, 0x4208);
+  if (WiFi.status() != WL_CONNECTED) { canvas.setTextColor(TFT_ORANGE); canvas.drawString("no Wi-Fi", 2, 117); }
+  else { canvas.setTextColor(TFT_GREENYELLOW); canvas.drawString("gateway ch " + String((int)WiFi.channel()), 2, 117); }
+  canvas.setTextColor(0x8410);
+  canvas.setTextDatum(TR_DATUM);
+  canvas.drawString(clockStr(time(nullptr)), 126, 117);
+  canvas.setTextDatum(TL_DATUM);
+  canvas.pushSprite(0, 0);
+}
+
 static void drawScreen() {
+  if (!cfg.ownMeter && !configMode) { drawGateway(); return; }
   canvas.fillScreen(TFT_BLACK);
   canvas.setTextDatum(TL_DATUM);
 
@@ -603,7 +978,7 @@ static void drawScreen() {
     canvas.drawString("Password:", 2, 72);
     canvas.drawString(AP_PASSWORD, 2, 84);
     canvas.drawString("Open 192.168.4.1", 2, 100);
-    canvas.drawString("Still counting", 2, 116);
+    canvas.drawString(cfg.ownMeter ? "Still counting" : "Gateway paused", 2, 116);
     canvas.pushSprite(0, 0);
     return;
   }
@@ -760,7 +1135,10 @@ void loop() {
     }
   }
   if (M5.BtnA.wasReleased()) {
-    if (!longHandled && !wakePress) showPulses = !showPulses;
+    if (!longHandled && !wakePress) {
+      if (cfg.ownMeter) showPulses = !showPulses;
+      else gwPage++;  // next machine (wraps back to the list)
+    }
     longHandled = false;
     wakePress = false;
   }
@@ -776,7 +1154,11 @@ void loop() {
   static bool wasConnected = false;
   static uint32_t ipShownAt = 0;
   bool conn = WiFi.status() == WL_CONNECTED;
-  if (conn && !wasConnected && !configMode) { ipShownAt = millis(); Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str()); }
+  if (conn && !wasConnected && !configMode) {
+    ipShownAt = millis();
+    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    startGateway();
+  }
   wasConnected = conn;
 
   static uint32_t lastDraw = 0;

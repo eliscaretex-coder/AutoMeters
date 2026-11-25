@@ -2,21 +2,22 @@
 //  Water meter reader - Seeed Studio XIAO ESP32-C6 (battery + deep sleep)
 //
 //  Counts up to 3 water meters (Cold, Warm, Hot) from the same reed contact
-//  that drives each Trumeter 7111 counter, and sends the totals to Supabase
-//  (function submit_reading, same as the AtomS3R version).
+//  that drives each Trumeter 7111 counter, and sends the totals over ESP-NOW
+//  to the AtomS3R gateway, which forwards them to Supabase.
 //
 //  How it saves battery:
 //  - Between pulses the chip is in deep sleep (~15 uA). Each change of a
 //    contact (close or open) wakes it for a fraction of a second to count.
-//  - Wi-Fi is only switched on to send, every "Send every (min)".
+//  - The radio is only switched on to send, every "Send every (min)", and
+//    only for a fraction of a second: no router, no internet.
 //
 //  After power-up or the RESET button (the "test window"):
 //  - The yellow LED blinks fast for 3 s. Press BOOT during those 3 s to enter
 //    SETUP (the XIAO's own Wi-Fi "WaterMeter-XXXX", password "watermeter",
-//    page http://192.168.4.1/). With no Wi-Fi saved it goes to SETUP by itself.
+//    page http://192.168.4.1/). Before the first set-up it goes there by itself.
 //  - Then it stays awake for 10 minutes: the LED flashes on each pulse, the
-//    serial monitor shows each pulse and the settings page is at
-//    http://<ip>/ (user "admin"). It sends once 20 s after joining the Wi-Fi.
+//    serial monitor shows each pulse, and a short press on BOOT sends a
+//    reading (3 short LED blinks = the gateway got it, 1 long = no answer).
 //  - After the 10 minutes it goes to deep sleep (Power mode "Battery"), or
 //    stays awake for good (Power mode "Always on", for USB-powered units).
 //
@@ -30,9 +31,6 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-#include <ArduinoJson.h>
 #include <esp_timer.h>
 #include <esp_sleep.h>
 #include <esp_mac.h>
@@ -40,27 +38,15 @@
 #include <soc/soc_caps.h>
 #include <esp_idf_version.h>
 #include <time.h>
-#include "supabase_roots.h"
+#include <esp_now.h>
+#include <esp_wifi.h>
 
-#define FW_VERSION "3.0.0-c6"
+#define FW_VERSION "3.1.0-c6"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
 #endif
-#ifndef SUPABASE_URL
-#define SUPABASE_URL "https://obdltdjykzrxxpozupqt.supabase.co"
-#endif
-#ifndef SUPABASE_KEY
-#define SUPABASE_KEY "sb_publishable_BQwFl3_6XV9igdkYUJTFbA_UHM5OhOZ"   // publishable key (public by design)
-#endif
-#ifndef INGEST_TOKEN
-#define INGEST_TOKEN ""   // from: select private.create_ingest_token('...');
-#endif
-static const char *DEFAULT_URL = SUPABASE_URL;
-static const char *DEFAULT_KEY = SUPABASE_KEY;
-static const char *DEFAULT_TOKEN = INGEST_TOKEN;
-static const char *RPC_PATH = "/rest/v1/rpc/submit_reading";
-
+#include "espnow_link.h"   // after secrets.h, which may set MESH_KEY
 // ----------------------------------------------------------------------------
 // Board pins (XIAO ESP32-C6)
 // ----------------------------------------------------------------------------
@@ -91,7 +77,6 @@ static const uint32_t FIRST_SEND_DELAY_MS = 20UL * 1000;
 static const uint32_t RETRY_MIN = 5;                       // retry after a failed send (first 3 times)
 static const uint32_t CONFIG_LONGPRESS_MS = 5000;
 static const uint32_t CONFIG_AP_TIMEOUT_MS = 15UL * 60 * 1000;
-static const uint32_t WIFI_TIMEOUT_MS = 15000;
 static const char *AP_PASSWORD = "watermeter";
 
 enum InputMode : uint8_t {
@@ -113,15 +98,12 @@ struct ChannelCfg {
 struct Config {
   String machine;
   String kind;     // washer | boiler | canteen | other
-  String ssid;
-  String pass;
-  String url;
-  String key;
-  String token;
   String adminPass;
   uint16_t intervalMin;
   uint16_t debounceMs;
   uint8_t power;   // PowerMode
+  String meshKey;  // ESP-NOW network key, same as on the gateway
+  bool configured; // settings saved at least once
   ChannelCfg ch[NUM_CH];
 } cfg;
 
@@ -131,18 +113,13 @@ static void loadConfig() {
   prefs.begin("cfg", true);
   cfg.machine = prefs.getString("mach", "Machine 01");
   cfg.kind = prefs.getString("kind", "washer");
-  cfg.ssid = prefs.getString("ssid", "");
-  cfg.pass = prefs.getString("pass", "");
-  cfg.url = prefs.getString("url", "");
-  cfg.key = prefs.getString("key", "");
-  cfg.token = prefs.getString("tok", "");
-  if (cfg.url.isEmpty()) cfg.url = DEFAULT_URL;
-  if (cfg.key.isEmpty()) cfg.key = DEFAULT_KEY;
-  if (cfg.token.isEmpty()) cfg.token = DEFAULT_TOKEN;
   cfg.adminPass = prefs.getString("adm", "watermeter");
-  cfg.intervalMin = prefs.getUShort("int", 60);
+  cfg.intervalMin = prefs.getUShort("int", 15);
   cfg.debounceMs = prefs.getUShort("deb", 30);
   cfg.power = prefs.getUChar("pwr", POWER_BATTERY);
+  cfg.meshKey = prefs.getString("mkey", "");
+  if (cfg.meshKey.isEmpty()) cfg.meshKey = MESH_KEY;
+  cfg.configured = prefs.getBool("done", prefs.isKey("mach"));
   for (int i = 0; i < NUM_CH; i++) {
     char k[8];
     snprintf(k, sizeof k, "c%den", i);  cfg.ch[i].enabled = prefs.getBool(k, true);
@@ -160,15 +137,13 @@ static void saveConfig() {
   prefs.begin("cfg", false);
   prefs.putString("mach", cfg.machine);
   prefs.putString("kind", cfg.kind);
-  prefs.putString("ssid", cfg.ssid);
-  prefs.putString("pass", cfg.pass);
-  prefs.putString("url", cfg.url);
-  prefs.putString("key", cfg.key);
-  prefs.putString("tok", cfg.token);
   prefs.putString("adm", cfg.adminPass);
   prefs.putUShort("int", cfg.intervalMin);
   prefs.putUShort("deb", cfg.debounceMs);
   prefs.putUChar("pwr", cfg.power);
+  prefs.putString("mkey", cfg.meshKey);
+  prefs.putBool("done", true);
+  cfg.configured = true;
   for (int i = 0; i < NUM_CH; i++) {
     char k[8];
     snprintf(k, sizeof k, "c%den", i);  prefs.putBool(k, cfg.ch[i].enabled);
@@ -201,8 +176,7 @@ RTC_DATA_ATTR static uint32_t rtcBootId = 0;
 RTC_DATA_ATTR static uint32_t rtcSeq = 0;
 RTC_DATA_ATTR static uint8_t rtcFails = 0;
 RTC_DATA_ATTR static uint32_t rtcWakes = 0;
-RTC_DATA_ATTR static int32_t rtcWifiChannel = 0;       // to rejoin the Wi-Fi faster
-RTC_DATA_ATTR static uint8_t rtcBssid[6];
+RTC_DATA_ATTR static uint8_t rtcLinkChannel = 0;        // gateway's channel, last time it answered
 
 // ----------------------------------------------------------------------------
 // Pulse counting (sampled every 1 ms with a debounce filter)
@@ -355,71 +329,6 @@ static String macString() {
   return b;
 }
 
-static bool doSend() {
-  if (cfg.url.isEmpty()) { lastSendMsg = "no URL"; return false; }
-  if (cfg.key.isEmpty()) { lastSendMsg = "no API key"; return false; }
-  if (cfg.token.isEmpty()) { lastSendMsg = "no token"; return false; }
-
-  JsonDocument doc;
-  JsonObject p = doc["payload"].to<JsonObject>();
-  p["token"] = cfg.token;
-  p["machine"] = cfg.machine;
-  p["kind"] = cfg.kind;
-  p["device"] = macString();
-  p["fw"] = FW_VERSION;
-  p["board"] = "xiao-esp32c6";
-  p["boot"] = rtcBootId;
-  p["seq"] = ++rtcSeq;
-  p["uptime_s"] = (uint32_t)time(nullptr);  // time() counts from power-up, also through deep sleep
-  p["rssi"] = WiFi.RSSI();
-  p["wakes"] = rtcWakes;
-  if (lastBattery > 0) p["battery_v"] = serialized(String(lastBattery, 2));
-  p["power"] = cfg.power == POWER_BATTERY ? "battery" : "always_on";
-  JsonArray arr = p["channels"].to<JsonArray>();
-  for (int i = 0; i < NUM_CH; i++) {
-    JsonObject o = arr.add<JsonObject>();
-    o["name"] = CH_NAMES[i];
-    o["enabled"] = st[i].en;
-    o["pulses"] = (unsigned long long)getPulses(i);
-    o["lpp"] = cfg.ch[i].lpp;
-    o["litres"] = litres(i);
-  }
-  String body;
-  serializeJson(doc, body);
-
-  String url = cfg.url;
-  while (url.endsWith("/")) url.remove(url.length() - 1);
-  url += RPC_PATH;
-
-  WiFiClientSecure client;
-  client.setCACert(SUPABASE_ROOT_CAS);
-  HTTPClient http;
-  http.setTimeout(20000);
-  if (!http.begin(client, url)) { lastSendMsg = "bad URL"; return false; }
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", cfg.key);
-  if (cfg.key.startsWith("eyJ")) http.addHeader("Authorization", "Bearer " + cfg.key);
-  int code = http.POST(body);
-  String resp = code > 0 ? http.getString() : String();
-  http.end();
-
-  bool ok = code == 200 && (resp.indexOf("\"ok\":true") >= 0 || resp.indexOf("\"ok\": true") >= 0);
-  if (ok) {
-    lastSendOk = true;
-    lastSendOkMs = millis();
-    lastSendMsg = "sent OK";
-    Serial.println("Send OK");
-  } else {
-    lastSendOk = false;
-    if (resp.indexOf("\"token\"") >= 0) lastSendMsg = "wrong token";
-    else if (code == 401) lastSendMsg = "wrong API key";
-    else if (code == 404) lastSendMsg = "run SQL setup";
-    else lastSendMsg = "error " + String(code);
-    Serial.printf("Send failed: HTTP %d %s\n", code, resp.substring(0, 200).c_str());
-  }
-  return ok;
-}
-
 static void scheduleNext(bool ok) {
   time_t now = time(nullptr);
   if (ok) {
@@ -439,47 +348,111 @@ static void rfSwitchOn() {
   digitalWrite(PIN_RF_SELECT, LOW);  // built-in antenna
 }
 
-static String hostName() {
-  String host = "watermeter-" + cfg.machine;
-  host.replace(" ", "-");
-  host.toLowerCase();
-  return host.substring(0, 31);
+// ---- ESP-NOW to the gateway ----------------------------------------------
+static const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static volatile bool ackGot = false;
+static LinkAck ackPkt;
+static uint32_t ackWantSeq = 0, ackWantBoot = 0;
+static uint8_t myMac[6];
+
+#if ESP_IDF_VERSION_MAJOR >= 5
+static void onLinkRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+#else
+static void onLinkRecv(const uint8_t *mac, const uint8_t *data, int len) {
+#endif
+  if (len != (int)sizeof(LinkAck)) return;
+  LinkAck a;
+  memcpy(&a, data, sizeof a);
+  if (a.magic != LINK_MAGIC || a.version != LINK_VERSION || a.type != LINK_ACK) return;
+  if (a.seq != ackWantSeq || a.boot != ackWantBoot || memcmp(a.dest, myMac, 6) != 0) return;
+  if (a.tag != link_tag(cfg.meshKey.c_str(), &a, sizeof a)) return;
+  ackPkt = a;
+  ackGot = true;
 }
 
-static bool waitWifi(uint32_t ms) {
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < ms) delay(50);
-  return WiFi.status() == WL_CONNECTED;
-}
-
-// Battery mode: join the Wi-Fi, send once, switch the radio off
-static void sendCycle() {
+static bool sendViaGateway() {
   lastBattery = batteryVolts();
+  LinkReading r;
+  memset(&r, 0, sizeof r);
+  r.magic = LINK_MAGIC;
+  r.version = LINK_VERSION;
+  r.type = LINK_READING;
+  r.boot = rtcBootId;
+  r.seq = ++rtcSeq;
+  r.uptime_s = (uint32_t)time(nullptr);
+  r.wakes = rtcWakes;
+  r.battery_mv = (uint16_t)(lastBattery * 1000.0f + 0.5f);
+  r.power = cfg.power;
+  r.nch = NUM_CH;
+  strncpy(r.machine, cfg.machine.c_str(), sizeof r.machine - 1);
+  strncpy(r.kind, cfg.kind.c_str(), sizeof r.kind - 1);
+  strncpy(r.fw, FW_VERSION, sizeof r.fw - 1);
+  for (int i = 0; i < NUM_CH; i++) {
+    r.ch[i].enabled = st[i].en;
+    strncpy(r.ch[i].name, CH_NAMES[i], sizeof r.ch[i].name);
+    r.ch[i].pulses = getPulses(i);
+    r.ch[i].lpp = cfg.ch[i].lpp;
+  }
+  r.tag = link_tag(cfg.meshKey.c_str(), &r, sizeof r);
+
   rfSwitchOn();
-  WiFi.persistent(false);
-  WiFi.setHostname(hostName().c_str());
   WiFi.mode(WIFI_STA);
-  bool conn = false;
-  if (rtcWifiChannel > 0) {  // fast path: known channel and access point
-    WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str(), rtcWifiChannel, rtcBssid);
-    conn = waitWifi(7000);
-    if (!conn) { WiFi.disconnect(); rtcWifiChannel = 0; }
+  esp_read_mac(myMac, ESP_MAC_WIFI_STA);
+  ackWantSeq = r.seq;
+  ackWantBoot = r.boot;
+  ackGot = false;
+  if (esp_now_init() != ESP_OK) {
+    lastSendMsg = "ESP-NOW error";
+    WiFi.mode(WIFI_OFF);
+    return false;
   }
-  if (!conn) {
-    WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
-    conn = waitWifi(WIFI_TIMEOUT_MS);
-  }
+  esp_now_register_recv_cb(onLinkRecv);
+  esp_now_peer_info_t peer;
+  memset(&peer, 0, sizeof peer);
+  memcpy(peer.peer_addr, BROADCAST, 6);
+  peer.channel = 0;  // whatever channel the radio is on
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+
+  // Last channel that worked (twice), then all the others
+  uint8_t order[16];
+  int n = 0;
+  if (rtcLinkChannel >= 1 && rtcLinkChannel <= 13) { order[n++] = rtcLinkChannel; order[n++] = rtcLinkChannel; }
+  for (uint8_t c = 1; c <= 13; c++) if (c != rtcLinkChannel) order[n++] = c;
+
   bool ok = false;
-  if (conn) {
-    rtcWifiChannel = WiFi.channel();
-    memcpy(rtcBssid, WiFi.BSSID(), 6);
-    ok = doSend();
-  } else {
-    lastSendMsg = "no Wi-Fi";
-    Serial.println("Wi-Fi not reached");
+  uint8_t usedCh = 0;
+  for (int i = 0; i < n && !ok; i++) {
+    esp_wifi_set_channel(order[i], WIFI_SECOND_CHAN_NONE);
+    esp_now_send(BROADCAST, (const uint8_t *)&r, sizeof r);
+    uint32_t t0 = millis();
+    while (!ackGot && millis() - t0 < 120) delay(2);
+    if (ackGot) { ok = true; usedCh = order[i]; }
   }
-  WiFi.disconnect(true);
+  esp_now_deinit();
   WiFi.mode(WIFI_OFF);
+
+  if (ok) {
+    rtcLinkChannel = ackPkt.channel ? ackPkt.channel : usedCh;
+    lastSendOk = true;
+    lastSendOkMs = millis();
+    lastSendMsg = "gateway OK (ch " + String(rtcLinkChannel) + ", " + String(ackPkt.rssi) + " dBm)";
+  } else {
+    rtcLinkChannel = 0;
+    lastSendOk = false;
+    lastSendMsg = "no answer from the gateway";
+  }
+  Serial.printf("Reading %lu -> %s\n", (unsigned long)r.seq, lastSendMsg.c_str());
+  return ok;
+}
+
+// Settings are enough to send?
+static bool linkReady() { return cfg.configured; }
+
+// Battery mode: send once, switch the radio off
+static void sendCycle() {
+  bool ok = sendViaGateway();
   saveCounts(true);
   scheduleNext(ok);
 }
@@ -563,7 +536,7 @@ static void handleWake(esp_sleep_wakeup_cause_t cause) {
   for (int i = 0; i < NUM_CH; i++) rtcPulses[i] = getPulses(i);
 
   if (pulsesSinceSave() >= SAVE_EVERY_PULSES) saveCounts(false);
-  if (time(nullptr) >= rtcNextSend && !cfg.ssid.isEmpty()) {
+  if (time(nullptr) >= rtcNextSend && linkReady()) {
     startTickTimer();  // keep counting while the Wi-Fi is on
     sendCycle();
   }
@@ -640,8 +613,6 @@ static void handleRoot() {
   }
   float bv = batteryVolts();
   h += "</table><div class='muted'>Battery: " + (bv > 0 ? String(bv, 2) + " V" : String("no divider")) +
-       " &middot; Wi-Fi: " +
-       (WiFi.status() == WL_CONNECTED ? esc(WiFi.SSID()) + " (" + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)" : String("not connected")) +
        " &middot; last send: " + esc(lastSendMsg) + "</div>";
   if (cfg.power == POWER_BATTERY && !configMode) {
     uint32_t left = TEST_WINDOW_MS - umin(TEST_WINDOW_MS, millis() - testWindowStartMs);
@@ -649,19 +620,12 @@ static void handleRoot() {
   }
 
   h += "<form method='post' action='/save'>";
-  h += "<h2>Machine and network</h2><fieldset><legend>General</legend>";
+  h += "<h2>Machine</h2><fieldset><legend>General</legend>";
   h += "<label>Machine name</label><input name='mach' maxlength='32' value='" + esc(cfg.machine) + "'>";
   h += "<label>Type</label><select name='kind'>" + opt("washer", "Washing machine", cfg.kind == "washer") +
        opt("boiler", "Boiler", cfg.kind == "boiler") + opt("canteen", "Canteen", cfg.kind == "canteen") +
        opt("other", "Other", cfg.kind == "other") + "</select>";
-  h += "<label>Wi-Fi network</label><input name='ssid' list='nets' value='" + esc(cfg.ssid) + "'><datalist id='nets'>";
-  int n = WiFi.scanComplete();
-  if (n > 0) for (int i = 0; i < n; i++) h += "<option value='" + esc(WiFi.SSID(i)) + "'>";
-  h += "</datalist>";
-  h += "<label>Wi-Fi password (leave blank to keep)</label><input name='pass' type='password'>";
-  h += "<label>Supabase project URL</label><input name='url' value='" + esc(cfg.url) + "'>";
-  h += "<label>Supabase publishable key (sb_publishable_...)</label><input name='key' value='" + esc(cfg.key) + "'>";
-  h += "<label>Ingest token (blank = keep)</label><input name='tok' type='password' placeholder='" + String(cfg.token.length() ? "saved" : "not set") + "'>";
+  h += "<label>Network key (the same on the Atom gateway)</label><input name='mkey' maxlength='32' value='" + esc(cfg.meshKey) + "'>";
   h += "<div class='row'><div><label>Send every (min)</label><input name='int' type='number' min='1' max='1440' value='" + String(cfg.intervalMin) + "'></div>";
   h += "<div><label>Debounce filter (ms)</label><input name='deb' type='number' min='2' max='500' value='" + String(cfg.debounceMs) + "'></div></div>";
   h += "<label>Power mode</label><select name='pwr'>" +
@@ -714,14 +678,11 @@ static void handleSave() {
   if (n.machine.isEmpty()) n.machine = "Machine";
   n.kind = server.arg("kind");
   if (n.kind != "washer" && n.kind != "boiler" && n.kind != "canteen" && n.kind != "other") n.kind = "washer";
-  n.ssid = server.arg("ssid"); n.ssid.trim();
-  if (server.arg("pass").length()) n.pass = server.arg("pass");
-  n.url = server.arg("url"); n.url.trim();
-  n.key = server.arg("key"); n.key.trim();
-  if (server.arg("tok").length()) { n.token = server.arg("tok"); n.token.trim(); }
   n.intervalMin = constrain(server.arg("int").toInt(), 1, 1440);
   n.debounceMs = constrain(server.arg("deb").toInt(), 2, 500);
   n.power = server.arg("pwr").toInt() == 1 ? POWER_ALWAYS_ON : POWER_BATTERY;
+  n.meshKey = server.arg("mkey"); n.meshKey.trim();
+  if (n.meshKey.isEmpty()) n.meshKey = MESH_KEY;
   if (server.arg("adm").length()) n.adminPass = server.arg("adm");
 
   String err;
@@ -743,7 +704,7 @@ static void handleSave() {
   cfg = n;
   saveConfig();
   saveCounts(true);
-  sendMessagePage("Saved", "Restarting. The yellow LED blinks for 3 s, then the XIAO joins the Wi-Fi and sends a first reading after about 20 s.", false);
+  sendMessagePage("Saved", "Restarting. The yellow LED blinks for 3 s, then the XIAO sends a first reading (after about 3 s). Short press on BOOT sends again.", false);
   delay(1500);
   ESP.restart();
 }
@@ -762,7 +723,7 @@ static void handleCounts() {
 
 static void handleSendNow() {
   if (!checkAuth()) return;
-  if (configMode) { sendMessagePage("SETUP mode", "To send, save the settings first (the XIAO joins the Wi-Fi after restarting).", true); return; }
+  if (configMode) { sendMessagePage("SETUP mode", "To send, save the settings first. After the restart, a short press on BOOT sends a reading.", true); return; }
   sendRequested = true;
   sendMessagePage("Sending", "Send requested. Refresh the main page in a few seconds to see the result.", true);
 }
@@ -806,14 +767,6 @@ static void startConfigMode() {
   Serial.printf("SETUP mode: Wi-Fi %s password %s -> http://192.168.4.1/\n", apName.c_str(), AP_PASSWORD);
 }
 
-static void startStation() {
-  WiFi.persistent(false);
-  WiFi.setHostname(hostName().c_str());
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
-}
-
 // ----------------------------------------------------------------------------
 // setup / loop
 // ----------------------------------------------------------------------------
@@ -838,7 +791,6 @@ void setup() {
     rtcSeq = 0;
     rtcFails = 0;
     rtcWakes = 0;
-    rtcWifiChannel = 0;
   }
   delay(300);  // give the USB serial a moment
   Serial.printf("\nWater meter %s on XIAO ESP32-C6, %s\n", FW_VERSION, macString().c_str());
@@ -854,7 +806,7 @@ void setup() {
   startTickTimer();
 
   // 3 s window: press BOOT for SETUP
-  bool wantSetup = cfg.ssid.isEmpty();
+  bool wantSetup = !linkReady();
   if (!wantSetup) {
     Serial.println("Press BOOT now (LED blinking) for SETUP mode...");
     uint32_t t0 = millis();
@@ -867,8 +819,8 @@ void setup() {
   }
 
   if (wantSetup) startConfigMode();
-  else startStation();
-  setupServer();
+  else { WiFi.mode(WIFI_OFF); Serial.println("Sending to the Atom gateway (ESP-NOW). Short press BOOT to send now."); }
+  if (configMode) setupServer();  // no page when the radio is off
   lastBattery = batteryVolts();
   if (lastBattery > 0) Serial.printf("Battery: %.2f V\n", lastBattery);
   else Serial.println("Battery: no divider on the MTMS pad");
@@ -898,6 +850,7 @@ void loop() {
   if (!configMode) led(g_lastAnyPulseMs && millis() - g_lastAnyPulseMs < 150);
 
   // Always-on mode: hold BOOT 5 s for SETUP
+  // BOOT: short press = send now, hold 5 s = SETUP
   static uint32_t bootDownAt = 0;
   if (digitalRead(PIN_BOOT) == LOW) {
     if (!bootDownAt) bootDownAt = millis();
@@ -905,13 +858,15 @@ void loop() {
       saveCounts(true);
       WiFi.disconnect(true);
       startConfigMode();
+      setupServer();
     }
   } else {
+    if (bootDownAt && !configMode && millis() - bootDownAt > 50 && millis() - bootDownAt < 1000) sendRequested = true;
     bootDownAt = 0;
   }
 
   // SETUP times out
-  if (configMode && !cfg.ssid.isEmpty() && millis() - configStartMs > CONFIG_AP_TIMEOUT_MS) {
+  if (configMode && linkReady() && millis() - configStartMs > CONFIG_AP_TIMEOUT_MS) {
     saveCounts(true);
     ESP.restart();
   }
@@ -920,14 +875,8 @@ void loop() {
   static uint32_t connectedAt = 0;
   static uint32_t lastAttempt = 0;
   static bool firstDone = false;
-  if (!configMode && WiFi.status() == WL_CONNECTED) {
-    if (connectedAt == 0) {
-      connectedAt = millis();
-      Serial.printf("Wi-Fi OK, IP %s (%d dBm). Settings page: http://%s/\n", WiFi.localIP().toString().c_str(),
-                    WiFi.RSSI(), WiFi.localIP().toString().c_str());
-      rtcWifiChannel = WiFi.channel();
-      memcpy(rtcBssid, WiFi.BSSID(), 6);
-    }
+  if (!configMode) {
+    if (connectedAt == 0) connectedAt = millis() - FIRST_SEND_DELAY_MS + 3000;  // first reading 3 s after start-up
     uint32_t interval = (uint32_t)cfg.intervalMin * 60000UL;
     bool due = (!firstDone && millis() - connectedAt >= FIRST_SEND_DELAY_MS) ||
                (firstDone && millis() - lastAttempt >= interval);
@@ -935,13 +884,13 @@ void loop() {
       sendRequested = false;
       firstDone = true;
       lastAttempt = millis();
-      lastBattery = batteryVolts();
-      bool ok = doSend();
+      bool ok = sendViaGateway();
+      // LED: 3 short blinks = the gateway got it, 1 long = no answer
+      if (ok) for (int b = 0; b < 3; b++) { led(true); delay(80); led(false); delay(120); }
+      else { led(true); delay(800); led(false); }
       saveCounts(true);
       scheduleNext(ok);
     }
-  } else {
-    connectedAt = 0;
   }
 
   static uint32_t lastSaveMs = 0;
