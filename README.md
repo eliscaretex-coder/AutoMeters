@@ -16,6 +16,7 @@ Atom (firmware/) --HTTPS--> Supabase: rpc/submit_reading --> devices, readings, 
 | Folder | What is in it |
 |---|---|
 | `firmware/atoms3r_water_meter/` | Arduino sketch for the AtomS3R (pulse counting, screen, settings page, sending). |
+| `firmware/xiao_c6_water_meter/` | Same for the Seeed XIAO ESP32-C6 on battery: deep sleep between pulses, Wi-Fi only to send. Bench test guide (Portuguese): `TESTE_BANCADA.md`. |
 | `supabase/migrations/` | SQL that creates the database: tables, Row Level Security, views and the `submit_reading` function. |
 | `docs/` | The web page (plain HTML/JS, no build step). Served by GitHub Pages. |
 | `GUIDE.md` | Installation guide: wiring, Supabase set-up, flashing, on-site set-up, troubleshooting. |
