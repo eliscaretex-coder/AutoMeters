@@ -497,15 +497,18 @@ static void goToSleep() {
     // Wake on the next change: open contact -> wake on LOW, closed -> wake on HIGH
     if (st[i].stable) lowMask |= 1ULL << st[i].pin;
     else highMask |= 1ULL << st[i].pin;
+    // The C6 has no separate RTC peripheral power domain: the pull-up is kept
+    // through deep sleep by holding the pad configuration.
     if (cfg.ch[i].mode == MODE_PULLUP) gpio_pullup_en(st[i].pin);
     else gpio_pullup_dis(st[i].pin);
     gpio_pulldown_dis(st[i].pin);
+    gpio_hold_en(st[i].pin);
   }
-#if SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
-  if (lowMask) esp_deep_sleep_enable_gpio_wakeup(lowMask, ESP_GPIO_WAKEUP_GPIO_LOW);
-  if (highMask) esp_deep_sleep_enable_gpio_wakeup(highMask, ESP_GPIO_WAKEUP_GPIO_HIGH);
+#if SOC_PM_SUPPORT_EXT1_WAKEUP && SOC_PM_SUPPORT_EXT1_WAKEUP_MODE_PER_PIN
+  // EXT1 with a wake level per pin: bits set in the level mask wake on HIGH
+  if (lowMask | highMask) esp_sleep_enable_ext1_wakeup_with_level_mask(lowMask | highMask, highMask);
 #else
-#error "This chip cannot wake from deep sleep on a GPIO level"
+#error "This chip cannot wake from deep sleep with a level per pin"
 #endif
   time_t now = time(nullptr);
   time_t wait = rtcNextSend > now ? rtcNextSend - now : 1;
@@ -523,9 +526,7 @@ static void handleWake(esp_sleep_wakeup_cause_t cause) {
   setupInputs();
   delayMicroseconds(200);
   uint64_t woke = 0;
-#if SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
-  if (cause == ESP_SLEEP_WAKEUP_GPIO) woke = esp_sleep_get_gpio_wakeup_status();
-#endif
+  if (cause == ESP_SLEEP_WAKEUP_EXT1) woke = esp_sleep_get_ext1_wakeup_status();
   uint32_t now = millis();
   for (int i = 0; i < NUM_CH; i++) {
     ChState &c = st[i];
@@ -811,7 +812,7 @@ void setup() {
   Serial.begin(115200);
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   bool fromSleep = rtcMagic == RTC_MAGIC &&
-                   (cause == ESP_SLEEP_WAKEUP_GPIO || cause == ESP_SLEEP_WAKEUP_TIMER);
+                   (cause == ESP_SLEEP_WAKEUP_EXT1 || cause == ESP_SLEEP_WAKEUP_TIMER);
   loadConfig();
 
   if (fromSleep && cfg.power == POWER_BATTERY) {
