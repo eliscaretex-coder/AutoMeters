@@ -48,8 +48,8 @@ A ligação de cada medidor é a mesma do Atom: **pino → diodo 1N4148 → term
 
 ## 4. Gravar a XIAO
 
-1. Abra `xiao_c6_water_meter/xiao_c6_water_meter.ino`. Na mesma pasta precisam estar
-   `secrets.h`, `supabase_roots.h` e `espnow_link.h`.
+1. Abra `xiao_c6_water_meter/xiao_c6_water_meter.ino`. Na mesma pasta precisa estar
+   `espnow_link.h` (o `secrets.h` é opcional).
 2. **Tools > Board > esp32 > XIAO_ESP32C6** (não a ESP32C3). **USB CDC On Boot: Enabled**.
 3. Clique em Upload. Se não gravar: segure **B**, aperte e solte **R**, solte **B** e tente de novo.
 4. Abra o Serial Monitor em 115200 e aperte **R**.
@@ -60,9 +60,8 @@ A ligação de cada medidor é a mesma do Atom: **pino → diodo 1N4148 → term
    antes, aperte **R** e, enquanto o LED pisca rápido (3 s), aperte **B**.
 2. No celular, conecte na rede **WaterMeter-XXXX** (senha `watermeter`). A página abre sozinha
    (ou abra `http://192.168.4.1`).
-3. Preencha o **Machine name** (ex.: `Machine 02`). Em **Send readings via**, deixe
-   **Atom gateway (ESP-NOW)**. A **Network key** precisa ser igual à do Atom. Os campos de
-   Wi-Fi podem ficar como estão. Clique em **Save and restart**.
+3. Preencha o **Machine name** (ex.: `Machine 02`). A **Network key** precisa ser igual à do
+   Atom. Clique em **Save and restart**.
 
 ## 6. Testar
 
@@ -94,5 +93,3 @@ A ligação de cada medidor é a mesma do Atom: **pino → diodo 1N4148 → term
 - **Alcance:** o ESP-NOW tem o alcance de um Wi-Fi comum. Teste com as placas perto e depois
   vá afastando. Caixa metálica e paredes grossas reduzem muito o sinal. Se uma máquina ficar
   longe, a XIAO tem um conector U.FL para antena externa.
-- Para voltar ao modo antigo (XIAO enviando direto pela internet), escolha **Wi-Fi straight to
-  Supabase** no SETUP e preencha o Wi-Fi.
