@@ -38,6 +38,7 @@
 #include <esp_mac.h>
 #include <driver/gpio.h>
 #include <soc/soc_caps.h>
+#include <esp_idf_version.h>
 #include <time.h>
 #include "supabase_roots.h"
 
@@ -504,11 +505,16 @@ static void goToSleep() {
     gpio_pulldown_dis(st[i].pin);
     gpio_hold_en(st[i].pin);
   }
-#if SOC_PM_SUPPORT_EXT1_WAKEUP && SOC_PM_SUPPORT_EXT1_WAKEUP_MODE_PER_PIN
-  // EXT1 with a wake level per pin: bits set in the level mask wake on HIGH
+#if SOC_PM_SUPPORT_EXT1_WAKEUP && SOC_PM_SUPPORT_EXT1_WAKEUP_MODE_PER_PIN && \
+    ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+  // ESP32 core 3.1 and newer: EXT1 with a wake level per pin (bits set in the level mask wake on HIGH)
   if (lowMask | highMask) esp_sleep_enable_ext1_wakeup_with_level_mask(lowMask | highMask, highMask);
+#elif SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
+  // ESP32 core 3.0: GPIO deep-sleep wake-up, one level per call
+  if (lowMask) esp_deep_sleep_enable_gpio_wakeup(lowMask, ESP_GPIO_WAKEUP_GPIO_LOW);
+  if (highMask) esp_deep_sleep_enable_gpio_wakeup(highMask, ESP_GPIO_WAKEUP_GPIO_HIGH);
 #else
-#error "This chip cannot wake from deep sleep with a level per pin"
+#error "Update the esp32 boards package (Tools > Board > Boards Manager > esp32) to version 3.3 or newer"
 #endif
   time_t now = time(nullptr);
   time_t wait = rtcNextSend > now ? rtcNextSend - now : 1;
@@ -527,6 +533,9 @@ static void handleWake(esp_sleep_wakeup_cause_t cause) {
   delayMicroseconds(200);
   uint64_t woke = 0;
   if (cause == ESP_SLEEP_WAKEUP_EXT1) woke = esp_sleep_get_ext1_wakeup_status();
+#if SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP && ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 3, 0)
+  if (cause == ESP_SLEEP_WAKEUP_GPIO) woke = esp_sleep_get_gpio_wakeup_status();
+#endif
   uint32_t now = millis();
   for (int i = 0; i < NUM_CH; i++) {
     ChState &c = st[i];
@@ -812,7 +821,7 @@ void setup() {
   Serial.begin(115200);
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   bool fromSleep = rtcMagic == RTC_MAGIC &&
-                   (cause == ESP_SLEEP_WAKEUP_EXT1 || cause == ESP_SLEEP_WAKEUP_TIMER);
+                   (cause == ESP_SLEEP_WAKEUP_EXT1 || cause == ESP_SLEEP_WAKEUP_GPIO || cause == ESP_SLEEP_WAKEUP_TIMER);
   loadConfig();
 
   if (fromSleep && cfg.power == POWER_BATTERY) {
