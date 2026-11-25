@@ -41,6 +41,7 @@ A ligação de cada medidor é a mesma do Atom: **pino → diodo 1N4148 → term
 1. Abra `atoms3r_water_meter/atoms3r_water_meter.ino`. Na mesma pasta precisam estar
    `secrets.h`, `supabase_roots.h` e `espnow_link.h`.
 2. Placa: a mesma de antes (AtomS3R / AtomS3), com **USB CDC On Boot: Enabled**. Clique em Upload.
+   Se aparecer "Sketch too big", escolha **Tools > Partition Scheme > Huge APP** e grave de novo.
 3. Ele mantém as configurações que já tinha. No Serial Monitor (115200) deve aparecer
    `Gateway on: listening for readers on channel N`.
 4. Na página do Atom (`http://<ip-do-atom>/`) aparece a seção **Battery readers**. A opção
