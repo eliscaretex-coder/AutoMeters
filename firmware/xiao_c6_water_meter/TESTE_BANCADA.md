@@ -9,9 +9,13 @@ XIAO (bateria) --ESP-NOW, sem roteador--> AtomS3R (USB, no Wi-Fi) --internet--> 
 - A **XIAO** (firmware `xiao_c6_water_meter`, versão 3.1.0-c6) conta os pulsos dormindo e, a
   cada 15 minutos, manda os totais por **ESP-NOW** direto para o Atom. O rádio fica ligado só
   uma fração de segundo. Ela não precisa da senha do Wi-Fi.
-- O **Atom** (firmware `atoms3r_water_meter`, versão 2.1.0) fica ligado no USB e no Wi-Fi.
-  Ele recebe as leituras das XIAO, responde a cada uma e envia tudo ao Supabase. Ele continua
-  lendo as 3 entradas da máquina onde está instalado.
+- O **Atom** (firmware `atoms3r_water_meter`, versão 2.2.0) fica ligado no USB e no Wi-Fi.
+  Ele recebe as leituras das XIAO, responde a cada uma e envia tudo ao Supabase. Ele não lê
+  medidor nenhum (dá para ligar isso na página: "This Atom also reads a machine").
+- **Tela do Atom:** a primeira página lista as máquinas com o total de litros (em laranja se
+  ela não manda nada há mais de 2 envios). Cada toque na tela mostra uma máquina com Fria,
+  Morna e Quente, quando foi o último envio e a bateria. Depois da última, volta para a lista.
+  Se o Atom reiniciar, a lista começa vazia e vai enchendo conforme as XIAO mandam (até 15 min).
 - A XIAO descobre sozinha o canal Wi-Fi do Atom e guarda esse canal. Se o roteador mudar de
   canal, ela procura de novo.
 - As duas placas precisam da mesma **Network key** (padrão `autometers-net`). Placas com outra

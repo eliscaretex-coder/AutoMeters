@@ -11,7 +11,11 @@
 //  - When on Wi-Fi, the page is also at http://<atom-ip>/
 //    (user "admin" + the password chosen in the settings).
 //
-//  Gateway: the Atom also listens for the battery meter readers (XIAO
+//  By default the Atom is only the gateway (no meters wired to it): the
+//  screen lists the readers. Tick "This Atom also reads a machine" on the
+//  settings page to count its own 3 inlets as well.
+//
+//  Gateway: the Atom listens for the battery meter readers (XIAO
 //  ESP32-C6) over ESP-NOW, answers them and forwards their readings to
 //  Supabase. The readers find the Atom's Wi-Fi channel by themselves; both
 //  sides need the same "Network key".
@@ -33,7 +37,7 @@
 #include <freertos/queue.h>
 #include "supabase_roots.h"
 
-#define FW_VERSION "2.1.0"
+#define FW_VERSION "2.2.0"
 
 // ----------------------------------------------------------------------------
 // Supabase project, publishable key and ingest token
@@ -103,6 +107,7 @@ struct Config {
   uint16_t debounceMs;
   uint16_t screenOffS;  // screen turns off after this many seconds (0 = always on)
   bool gateway;         // receive readings from the XIAO readers (ESP-NOW)
+  bool ownMeter;        // this Atom also reads a machine (its own 3 inlets)
   String meshKey;       // ESP-NOW network key, same as on the readers
   ChannelCfg ch[NUM_CH];
 } cfg;
@@ -128,6 +133,8 @@ static void loadConfig() {
   cfg.debounceMs = prefs.getUShort("deb", 30);
   cfg.screenOffS = prefs.getUShort("scr", 60);
   cfg.gateway = prefs.getBool("gw", true);
+  cfg.ownMeter = prefs.getBool("own", false);
+  if (!cfg.ownMeter) cfg.gateway = true;  // nothing else to do
   cfg.meshKey = prefs.getString("mkey", "");
   if (cfg.meshKey.isEmpty()) cfg.meshKey = MESH_KEY;
   for (int i = 0; i < NUM_CH; i++) {
@@ -156,6 +163,7 @@ static void saveConfig() {
   prefs.putUShort("deb", cfg.debounceMs);
   prefs.putUShort("scr", cfg.screenOffS);
   prefs.putBool("gw", cfg.gateway);
+  prefs.putBool("own", cfg.ownMeter);
   prefs.putString("mkey", cfg.meshKey);
   for (int i = 0; i < NUM_CH; i++) {
     char k[8];
@@ -255,7 +263,7 @@ static void setupCounting() {
   g_debounce = cfg.debounceMs;
   for (int i = 0; i < NUM_CH; i++) {
     ChState &c = st[i];
-    c.en = cfg.ch[i].enabled && pinAllowed(cfg.ch[i].pin);
+    c.en = cfg.ownMeter && cfg.ch[i].enabled && pinAllowed(cfg.ch[i].pin);
     c.pin = (gpio_num_t)cfg.ch[i].pin;
     c.run = 0;
     c.lastPulseMs = 0;
@@ -560,7 +568,7 @@ static void sendTask(void *) {
         sendRequested = false;
         firstDone = true;
         lastAttempt = millis();
-        doSend();
+        if (cfg.ownMeter) doSend();
       }
       uploadNodeReadings();
     } else {
@@ -621,12 +629,15 @@ static void handleRoot() {
   h += "<div class='muted'>Firmware " FW_VERSION " &middot; " + WiFi.macAddress() + "</div>";
 
   // Current status
-  h += "<h2>Current readings</h2><table><tr><th>Inlet</th><th>Pulses</th><th>Litres</th></tr>";
-  for (int i = 0; i < NUM_CH; i++) {
-    h += "<tr><td>" + String(CH_NAMES[i]) + (st[i].en ? "" : " (off)") + "</td><td>" +
-         String((unsigned long long)getPulses(i)) + "</td><td>" + String(litres(i), 1) + "</td></tr>";
+  if (cfg.ownMeter) {
+    h += "<h2>Current readings</h2><table><tr><th>Inlet</th><th>Pulses</th><th>Litres</th></tr>";
+    for (int i = 0; i < NUM_CH; i++) {
+      h += "<tr><td>" + String(CH_NAMES[i]) + (st[i].en ? "" : " (off)") + "</td><td>" +
+           String((unsigned long long)getPulses(i)) + "</td><td>" + String(litres(i), 1) + "</td></tr>";
+    }
+    h += "</table>";
   }
-  h += "</table><div class='muted'>Wi-Fi: " +
+  h += "<div class='muted'>Wi-Fi: " +
        (WiFi.status() == WL_CONNECTED ? esc(WiFi.SSID()) + " (" + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm)" : String("not connected")) +
        " &middot; last send: " + esc(lastSendMsg) + "</div>";
 
@@ -678,6 +689,7 @@ static void handleRoot() {
   h += "<div class='row'><div><label>Send every (min)</label><input name='int' type='number' min='1' max='1440' value='" + String(cfg.intervalMin) + "'></div>";
   h += "<div><label>Debounce filter (ms)</label><input name='deb' type='number' min='2' max='500' value='" + String(cfg.debounceMs) + "'></div></div>";
   h += "<label>Screen off after (seconds, 0 = always on)</label><input name='scr' type='number' min='0' max='3600' value='" + String(cfg.screenOffS) + "'>";
+  h += "<label><input type='checkbox' name='own' value='1'" + String(cfg.ownMeter ? " checked" : "") + "> This Atom also reads a machine (its own inlets, settings below)</label>";
   h += "<label><input type='checkbox' name='gw' value='1'" + String(cfg.gateway ? " checked" : "") + "> Gateway: receive the battery readers (XIAO) and send their readings</label>";
   h += "<label>Network key (the same on every XIAO reader)</label><input name='mkey' maxlength='32' value='" + esc(cfg.meshKey) + "'>";
   h += "<label>Time zone (POSIX)</label><input name='tz' value='" + esc(cfg.tz) + "'>";
@@ -685,8 +697,8 @@ static void handleRoot() {
   h += "<label>Password for this page, user admin (blank = keep)</label><input name='adm' type='password'>";
   h += "</fieldset>";
 
-  h += "<h2>Water inlets</h2>";
-  for (int i = 0; i < NUM_CH; i++) {
+  if (cfg.ownMeter) h += "<h2>Water inlets</h2>";
+  for (int i = 0; i < NUM_CH && cfg.ownMeter; i++) {
     String p = "c" + String(i);
     h += "<fieldset><legend>" + String(CH_NAMES[i]) + "</legend>";
     h += "<label><input type='checkbox' name='" + p + "en' value='1'" + (cfg.ch[i].enabled ? " checked" : "") + "> Inlet in use</label>";
@@ -703,6 +715,7 @@ static void handleRoot() {
   h += "<button type='submit'>Save and restart</button></form>";
 
   // Count adjustment
+  if (cfg.ownMeter) {
   h += "<h2>Match the count to the 7111</h2><form method='post' action='/counts'><fieldset><legend>Current pulses</legend>";
   h += "<div class='muted'>Type the number shown on each 7111 counter. Blank = leave as is.</div>";
   for (int i = 0; i < NUM_CH; i++) {
@@ -711,6 +724,7 @@ static void handleRoot() {
   h += "</fieldset><button type='submit'>Save count</button></form>";
 
   h += "<h2>Test</h2><form method='post' action='/send'><button type='submit'>Send a reading now</button></form>";
+  }
   if (configMode) h += "<form method='post' action='/exit'><button type='submit' style='background:#55606b'>Leave SETUP mode</button></form>";
   h += "</body></html>";
   server.send(200, "text/html; charset=utf-8", h);
@@ -738,6 +752,8 @@ static void handleSave() {
   n.debounceMs = constrain(server.arg("deb").toInt(), 2, 500);
   n.screenOffS = constrain(server.arg("scr").toInt(), 0, 3600);
   n.gateway = server.hasArg("gw");
+  n.ownMeter = server.hasArg("own");
+  if (!n.ownMeter) n.gateway = true;
   n.meshKey = server.arg("mkey"); n.meshKey.trim();
   if (n.meshKey.isEmpty()) n.meshKey = MESH_KEY;
   n.tz = server.arg("tz"); n.tz.trim();
@@ -745,7 +761,8 @@ static void handleSave() {
   if (server.arg("adm").length()) n.adminPass = server.arg("adm");
 
   String err;
-  for (int i = 0; i < NUM_CH; i++) {
+  // The inlet fields are only on the page when this Atom reads a machine
+  for (int i = 0; i < NUM_CH && server.hasArg("c0lpp"); i++) {
     String p = "c" + String(i);
     n.ch[i].enabled = server.hasArg(p + "en");
     n.ch[i].pin = (uint8_t)server.arg(p + "pin").toInt();
@@ -754,7 +771,7 @@ static void handleSave() {
     if (!pinAllowed(n.ch[i].pin)) err += "Invalid pin for " + String(CH_NAMES[i]) + ". ";
     if (n.ch[i].lpp <= 0) err += "Invalid litres per pulse for " + String(CH_NAMES[i]) + ". ";
   }
-  for (int i = 0; i < NUM_CH; i++)
+  for (int i = 0; i < NUM_CH && n.ownMeter; i++)
     for (int j = i + 1; j < NUM_CH; j++)
       if (n.ch[i].enabled && n.ch[j].enabled && n.ch[i].pin == n.ch[j].pin)
         err += String(CH_NAMES[i]) + " and " + CH_NAMES[j] + " are on the same pin. ";
@@ -825,7 +842,121 @@ static String fmtLitres(double l) {
   return String(l / 1000.0, 1) + " m3";
 }
 
+// Gateway-only screen. Page 0: one row per reader (most recent first).
+// Tap the screen: next page = one machine with its Cold / Warm / Hot litres.
+static int gwPage = 0;
+
+static void drawGateway() {
+  NodeInfo list[MAX_NODES];
+  int n = 0;
+  portENTER_CRITICAL(&nodesMux);
+  for (int i = 0; i < MAX_NODES; i++) if (nodes[i].used) list[n++] = nodes[i];
+  portEXIT_CRITICAL(&nodesMux);
+  // Pages in a stable order: by machine name
+  for (int a = 0; a < n; a++)
+    for (int b = a + 1; b < n; b++)
+      if (strncmp(list[b].machine, list[a].machine, sizeof list[a].machine) < 0) { NodeInfo t = list[a]; list[a] = list[b]; list[b] = t; }
+  if (gwPage > n) gwPage = 0;
+
+  canvas.fillScreen(TFT_BLACK);
+  canvas.setTextDatum(TL_DATUM);
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextColor(TFT_WHITE);
+
+  if (gwPage == 0) {
+    // ---- list of machines
+    canvas.drawString("Machines", 2, 0);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.setTextColor(0x8410);
+    canvas.drawString(String(n), 126, 0);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.drawFastHLine(0, 17, 128, 0x4208);
+    canvas.setFont(&fonts::Font0);
+    if (n == 0) {
+      canvas.setTextColor(0x8410);
+      canvas.drawString("No readers yet.", 2, 30);
+      canvas.drawString("Press BOOT on a", 2, 46);
+      canvas.drawString("XIAO to send.", 2, 58);
+    }
+    for (int i = 0; i < n && i < 6; i++) {
+      int y = 21 + i * 15;
+      uint32_t ago = (millis() - list[i].lastSeenMs) / 60000;
+      bool late = ago > 2UL * cfg.intervalMin + 5;
+      char name[34];
+      strncpy(name, list[i].machine, sizeof name);
+      name[33] = 0;
+      double total = 0;
+      for (int c = 0; c < list[i].nch; c++)
+        if (list[i].enabled[c]) total += (double)list[i].pulses[c] * list[i].lpp[c];
+      String right = fmtLitres(total);
+      String nm = name;
+      canvas.setTextColor(late ? TFT_ORANGE : TFT_WHITE);
+      while (nm.length() > 1 && canvas.textWidth(nm) + canvas.textWidth(right) > 118) nm.remove(nm.length() - 1);
+      canvas.drawString(nm, 2, y);
+      canvas.setTextDatum(TR_DATUM);
+      canvas.setTextColor(late ? TFT_ORANGE : 0xAD55);
+      canvas.drawString(right, 126, y);
+      canvas.setTextDatum(TL_DATUM);
+    }
+    if (n > 6) { canvas.setTextColor(0x8410); canvas.drawString("+" + String(n - 6) + " more, tap", 2, 21 + 6 * 15); }
+  } else {
+    // ---- one machine
+    const NodeInfo &m = list[gwPage - 1];
+    char name[34];
+    strncpy(name, m.machine, sizeof name);
+    name[33] = 0;
+    String title = name;
+    while (title.length() > 1 && canvas.textWidth(title) > 100) title.remove(title.length() - 1);
+    canvas.drawString(title, 2, 0);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.setTextColor(0x8410);
+    canvas.drawString(String(gwPage) + "/" + String(n), 126, 0);
+    canvas.drawFastHLine(0, 17, 128, 0x4208);
+    for (int c = 0; c < NUM_CH; c++) {
+      int y = 21 + c * 30;
+      bool en = c < m.nch && m.enabled[c];
+      canvas.fillRoundRect(0, y, 18, 26, 3, en ? chColor[c] : 0x4208);
+      canvas.setFont(&fonts::Font2);
+      canvas.setTextColor(TFT_BLACK);
+      canvas.setTextDatum(MC_DATUM);
+      canvas.drawString(CH_SHORT[c], 9, y + 13);
+      canvas.setTextDatum(MR_DATUM);
+      if (!en) { canvas.setTextColor(0x8410); canvas.drawString("off", 126, y + 13); continue; }
+      String v = showPulses ? String((unsigned long long)m.pulses[c]) : fmtLitres((double)m.pulses[c] * m.lpp[c]);
+      canvas.setFont(&fonts::Font4);
+      if (canvas.textWidth(v) > 104) canvas.setFont(&fonts::Font2);
+      canvas.setTextColor(TFT_WHITE);
+      canvas.drawString(v, 126, y + 14);
+    }
+    canvas.setTextDatum(TL_DATUM);
+    canvas.drawFastHLine(0, 112, 128, 0x4208);
+    canvas.setFont(&fonts::Font0);
+    uint32_t ago = (millis() - m.lastSeenMs) / 60000;
+    String foot = ago < 60 ? String(ago) + " min ago" : String(ago / 60) + " h ago";
+    canvas.setTextColor(ago > 2UL * cfg.intervalMin + 5 ? TFT_ORANGE : TFT_GREENYELLOW);
+    canvas.drawString(foot, 2, 117);
+    canvas.setTextColor(0x8410);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.drawString(m.battMv > 2000 ? String(m.battMv / 1000.0f, 2) + " V" : String(m.rssi) + " dBm", 126, 117);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.pushSprite(0, 0);
+    return;
+  }
+
+  // footer for the list page
+  canvas.setFont(&fonts::Font0);
+  canvas.drawFastHLine(0, 112, 128, 0x4208);
+  if (WiFi.status() != WL_CONNECTED) { canvas.setTextColor(TFT_ORANGE); canvas.drawString("no Wi-Fi", 2, 117); }
+  else { canvas.setTextColor(TFT_GREENYELLOW); canvas.drawString("gateway ch " + String((int)WiFi.channel()), 2, 117); }
+  canvas.setTextColor(0x8410);
+  canvas.setTextDatum(TR_DATUM);
+  canvas.drawString(clockStr(time(nullptr)), 126, 117);
+  canvas.setTextDatum(TL_DATUM);
+  canvas.pushSprite(0, 0);
+}
+
 static void drawScreen() {
+  if (!cfg.ownMeter && !configMode) { drawGateway(); return; }
   canvas.fillScreen(TFT_BLACK);
   canvas.setTextDatum(TL_DATUM);
 
@@ -847,7 +978,7 @@ static void drawScreen() {
     canvas.drawString("Password:", 2, 72);
     canvas.drawString(AP_PASSWORD, 2, 84);
     canvas.drawString("Open 192.168.4.1", 2, 100);
-    canvas.drawString("Still counting", 2, 116);
+    canvas.drawString(cfg.ownMeter ? "Still counting" : "Gateway paused", 2, 116);
     canvas.pushSprite(0, 0);
     return;
   }
@@ -1004,7 +1135,10 @@ void loop() {
     }
   }
   if (M5.BtnA.wasReleased()) {
-    if (!longHandled && !wakePress) showPulses = !showPulses;
+    if (!longHandled && !wakePress) {
+      if (cfg.ownMeter) showPulses = !showPulses;
+      else gwPage++;  // next machine (wraps back to the list)
+    }
     longHandled = false;
     wakePress = false;
   }
