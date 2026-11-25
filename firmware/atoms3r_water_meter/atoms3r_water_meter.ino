@@ -366,12 +366,6 @@ static bool doSend() {
 // ----------------------------------------------------------------------------
 // Gateway: readings from the XIAO readers over ESP-NOW
 // ----------------------------------------------------------------------------
-struct RxItem {
-  uint8_t mac[6];
-  int8_t rssi;
-  LinkReading r;
-};
-
 struct NodeInfo {
   bool used;
   uint8_t mac[6];
@@ -393,7 +387,7 @@ static portMUX_TYPE nodesMux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t rxQueue = nullptr;   // radio -> gateway task
 static QueueHandle_t upQueue = nullptr;   // gateway task -> sender task
 static bool gatewayRunning = false;
-static volatile uint32_t gwReceived = 0, gwBadKey = 0;
+static uint32_t gwReceived = 0, gwBadKey = 0;  // only written by the gateway task
 
 static String macStr(const uint8_t *m) {
   char b[18];
@@ -549,7 +543,7 @@ static void startGateway() {
   esp_now_register_recv_cb(onLinkRecv);
   xTaskCreatePinnedToCore(gatewayTask, "gateway", 6144, nullptr, 5, nullptr, 0);
   gatewayRunning = true;
-  Serial.printf("Gateway on: listening for readers on channel %d\n", WiFi.channel());
+  Serial.printf("Gateway on: listening for readers on channel %d\n", (int)WiFi.channel());
 }
 
 static void sendTask(void *) {

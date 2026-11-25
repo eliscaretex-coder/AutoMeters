@@ -61,6 +61,14 @@ struct __attribute__((packed)) LinkAck {
   uint64_t tag;
 };
 
+// What the gateway keeps for each packet it hears (defined here so that the
+// Arduino IDE's automatic prototypes can see it)
+struct RxItem {
+  uint8_t mac[6];
+  int8_t rssi;
+  LinkReading r;
+};
+
 // ---- SipHash-2-4 ------------------------------------------------------------
 static inline uint64_t link_rotl(uint64_t x, int b) { return (x << b) | (x >> (64 - b)); }
 #define LINK_SIPROUND                                              \
