@@ -79,7 +79,7 @@ button:hover, select:hover { border-color: var(--axis); }
 button.link { background: none; border: 0; color: var(--accent); padding: 4px 0; min-height: 0; }
 
 /* Machine cards */
-.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 12px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 12px; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; cursor: pointer; }
 .card:hover { border-color: var(--axis); }
 .card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
@@ -92,9 +92,9 @@ h3.group:first-child { margin-top: 0; }
 .status { font-size: 12px; white-space: nowrap; color: var(--ink-2); }
 .status::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; background: var(--ok); }
 .status.off::before { background: var(--warn); }
-.inlets { display: grid; grid-template-columns: auto 1fr 1fr 1fr; gap: 2px 10px; font-size: 14px; align-items: center; }
+.inlets { display: grid; grid-template-columns: auto 1fr auto auto; gap: 2px 10px; font-size: 14px; align-items: center; }
 .inlets .hdr { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
-.inlets .num { text-align: right; font-variant-numeric: tabular-nums; }
+.inlets .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .inlet { display: flex; align-items: center; gap: 6px; color: var(--ink-2); }
 .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; flex: none; }
 /* The counter looks like the 7111 display: plain digits, no grouping */
