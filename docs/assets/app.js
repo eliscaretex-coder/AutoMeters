@@ -1,6 +1,6 @@
 import { TIME_ZONE, OFFLINE_AFTER_MIN } from './config.js';
 import * as api from './api.js';
-import { renderStackedBars } from './chart.js';
+import { renderStackedBars, renderDayLines } from './chart.js';
 
 // Known meter inputs, in a fixed order with fixed colors (same as the Atom screen).
 // Any other channel name (e.g. "Water" on the boiler or canteen meter) uses --water.
@@ -25,7 +25,7 @@ const PERIODS = {
 };
 const WEEKS_SHOWN = 12;  // rows in the weekly table (also the oldest day loaded)
 
-const state = { period: 'week', selection: ALL_WASHERS, devices: [], chartArgs: null };
+const state = { period: 'week', selection: ALL_WASHERS, devices: [], chartArgs: null, day: null, dayArgs: null, channels: [] };
 const $ = (id) => document.getElementById(id);
 
 // ---------------------------------------------------------------------------
@@ -229,7 +229,10 @@ function renderDaily(series, channels, range) {
   const seriesDef = channels.map((c) => ({ key: c, label: c, cssVar: channelVar(c) }));
   const oneWeek = series.length <= 7;
   const tick = (key, short) => (short ? (oneWeek ? fmtWeekday(key) : fmtDay(key, true)) : fmtDay(key));
-  state.chartArgs = { rows: series, series: seriesDef, formatValue: fmtAxis, formatDay: tick };
+  state.chartArgs = {
+    rows: series, series: seriesDef, formatValue: fmtAxis, formatDay: tick,
+    onPick: (r) => { pickDay(r.day); $('dayview-title').scrollIntoView({ behavior: 'smooth', block: 'start' }); },
+  };
   $('daily-title').textContent = `Daily usage · ${selectionLabel()}`;
   $('legend').innerHTML = channels.length > 1 ? channels.map((c) => `<span>${swatch(c)}${esc(c)}</span>`).join('') : '';
   renderStackedBars($('chart'), state.chartArgs);
@@ -271,6 +274,87 @@ function renderRecent(rows) {
 }
 
 // ---------------------------------------------------------------------------
+// One day: litres used since midnight, one line per inlet
+// Each reading adds the usage since the previous reading at the time it was
+// sent, so the detail depends on how often the meter sends.
+// ---------------------------------------------------------------------------
+const hmFmt = new Intl.DateTimeFormat('en-GB', { timeZone: TIME_ZONE, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+const minuteOf = (iso) => { const [h, mi] = hmFmt.format(new Date(iso)).split(':').map(Number); return h * 60 + mi; };
+const hourOf = (iso) => Math.floor(minuteOf(iso) / 60);
+const hourLabel = (h) => `${String(h).padStart(2, '0')}:00`;
+const timeLabel = (t) => `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;  // 1440 -> 24:00
+
+async function loadDay() {
+  const day = state.day || todayKey();
+  state.day = day;
+  $('day').value = day;
+  $('day').max = todayKey();
+  $('day-next').disabled = day >= todayKey();
+  const ids = selectedDevices().map((d) => d.id);
+  const channels = state.channels;
+  $('dayview-title').textContent = `During the day · ${selectionLabel()}`;
+  if (!ids.length) { $('day-chart').innerHTML = '<p class="empty">No meters selected.</p>'; return; }
+  try {
+    // Irish midnight is 23:00 or 00:00 UTC: load a little either side, then keep the Irish day.
+    const since = `${addDays(day, -1)}T22:00:00Z`;
+    const until = `${addDays(day, 1)}T02:00:00Z`;
+    const rows = [];
+    for (let offset = 0; ; offset += 1000) {
+      const page = await api.channelUsage({ ids, since, until, limit: 1000, offset });
+      rows.push(...page);
+      if (page.length < 1000) break;
+    }
+    if (state.day !== day) return;  // another day was picked meanwhile
+    const mine = rows.filter((r) => dayKey(new Date(r.created_at)) === day);
+    const hours = Array.from({ length: 24 }, (_, h) => Object.fromEntries([['day', h], ...channels.map((c) => [c, 0])]));
+    for (const r of mine) {
+      const t = hours[hourOf(r.created_at)];
+      if (t && r.channel in t) t[r.channel] += Number(r.used_l) || 0;
+    }
+    // Running total since midnight per inlet (all selected meters added up)
+    const isToday = day === todayKey();
+    const endT = isToday ? minuteOf(new Date().toISOString()) : 1440;
+    const ordered = [...mine].sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
+    const lineSeries = channels.map((c) => {
+      const points = [{ t: 0, v: 0 }];
+      let acc = 0;
+      for (const r of ordered) {
+        if (r.channel !== c) continue;
+        acc += Number(r.used_l) || 0;
+        points.push({ t: minuteOf(r.created_at), v: acc });
+      }
+      points.push({ t: endT, v: acc });
+      return { label: c, cssVar: channelVar(c), points };
+    });
+    state.dayArgs = { series: lineSeries, formatValue: fmtAxis, formatTime: timeLabel, endT, ariaLabel: 'Litres used since midnight, one line per inlet' };
+    $('day-legend').innerHTML = channels.length > 1 ? channels.map((c) => `<span>${swatch(c)}${esc(c)}</span>`).join('') : '';
+    renderDayLines($('day-chart'), state.dayArgs);
+
+    const sums = Object.fromEntries(channels.map((c) => [c, hours.reduce((a, r) => a + r[c], 0)]));
+    const readings = new Set(mine.map((r) => r.reading_id)).size;
+    $('day-total').textContent = `${fmtDay(day)}: ${fmtL(sumOf(sums))}` +
+      (channels.length > 1 ? ` (${channels.map((c) => `${c.toLowerCase()} ${fmtL(sums[c])}`).join(', ')})` : '') +
+      ` · ${readings} reading${readings === 1 ? '' : 's'}. The lines show the litres used since midnight; each step is a reading sent by the meter.`;
+
+    const multi = channels.length > 1;
+    const used = hours.filter((r) => channels.some((c) => r[c] > 0));
+    $('day-table').innerHTML = used.length ? `<table>
+      <thead><tr><th>Hour</th>${channels.map((c) => `<th class="num">${esc(c)}</th>`).join('')}${multi ? '<th class="num">Total</th>' : ''}</tr></thead>
+      <tbody>${used.map((r) => `<tr><td>${hourLabel(r.day)}–${hourLabel((r.day + 1) % 24)}</td>${channels.map((c) => `<td class="num">${fmtL(r[c])}</td>`).join('')}${multi ? `<td class="num">${fmtL(channels.reduce((a, c) => a + r[c], 0))}</td>` : ''}</tr>`).join('')}</tbody>
+    </table>` : '<p class="empty">No water used on this day.</p>';
+  } catch (err) {
+    console.error(err);
+    $('day-chart').innerHTML = `<p class="empty">Could not load this day (${esc(err.message)}).</p>`;
+  }
+}
+
+function pickDay(key) {
+  if (!key) return;
+  state.day = key > todayKey() ? todayKey() : key;
+  loadDay();
+}
+
+// ---------------------------------------------------------------------------
 // Load
 // ---------------------------------------------------------------------------
 async function load() {
@@ -294,9 +378,11 @@ async function load() {
     const range = periodRange(state.period);
     renderDevices(totals, weekRows);
     renderSummary(daily, totals, ids, channels);
+    state.channels = channels;
     renderDaily(dailySeries(daily, range.from, range.to, channels), channels, range);
     renderWeekly(daily, channels);
     renderRecent(recent);
+    loadDay();
     notice('');
     $('updated').textContent = dtFmt.format(new Date());
   } catch (err) {
@@ -355,10 +441,22 @@ $('toggle-table').addEventListener('click', (e) => {
   $('chart').hidden = showTable;
   e.target.textContent = showTable ? 'Show as chart' : 'Show as table';
 });
+$('day').addEventListener('change', (e) => pickDay(e.target.value));
+$('day-prev').addEventListener('click', () => pickDay(addDays(state.day || todayKey(), -1)));
+$('day-next').addEventListener('click', () => pickDay(addDays(state.day || todayKey(), 1)));
+$('toggle-day-table').addEventListener('click', (e) => {
+  const showTable = $('day-table').hidden;
+  $('day-table').hidden = !showTable;
+  $('day-chart').hidden = showTable;
+  e.target.textContent = showTable ? 'Show as chart' : 'Show as table';
+});
 let resizeTimer;
 window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => { if (state.chartArgs) renderStackedBars($('chart'), state.chartArgs); }, 200);
+  resizeTimer = setTimeout(() => {
+    if (state.chartArgs) renderStackedBars($('chart'), state.chartArgs);
+    if (state.dayArgs) renderDayLines($('day-chart'), state.dayArgs);
+  }, 200);
 });
 setInterval(load, 5 * 60 * 1000);
 load();

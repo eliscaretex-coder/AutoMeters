@@ -110,6 +110,10 @@ h3.group:first-child { margin-top: 0; }
 .tile-rows.big { flex-direction: column; font-size: 17px; color: var(--ink); margin-top: 6px; }
 tr.current td { background: color-mix(in srgb, var(--accent) 7%, transparent); }
 
+.day-pick { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.day-pick input { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 5px 8px; min-height: 36px; }
+#day-prev, #day-next { min-width: 36px; padding: 4px 10px; }
+
 .card-foot { margin-top: 8px; font-size: 12px; color: var(--muted); }
 
 /* Panels, chart, tables */

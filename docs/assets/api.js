@@ -47,11 +47,12 @@ export const latestTotals = (ids) =>
 export const dailyUsage = ({ fromDay, ids }) =>
   getAll('daily_usage', { select: 'day,device_id,channel,used_l', day: `gte.${fromDay}`, device_id: inIds(ids), order: 'day.asc,device_id.asc,channel.asc' });
 
-export const channelUsage = ({ ids, since, limit = 300, offset = 0 }) =>
+export const channelUsage = ({ ids, since, until, limit = 300, offset = 0 }) =>
   get('channel_usage', {
     select: 'reading_id,created_at,device_id,channel,litres,pulses,used_l',
     device_id: inIds(ids),
     created_at: since ? `gte.${since}` : undefined,
+    and: until ? `(created_at.lt.${until})` : undefined,
     order: 'created_at.desc,reading_id.desc',
     limit,
     offset: offset || undefined,
