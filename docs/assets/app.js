@@ -16,7 +16,16 @@ const KIND_LABEL = { washer: 'Washing machines', boiler: 'Boiler', canteen: 'Can
 const KIND_ORDER = ['washer', 'boiler', 'canteen', 'other'];
 const ALL_WASHERS = 'washers';
 
-const state = { days: 30, selection: ALL_WASHERS, devices: [], chartArgs: null };
+// Weeks run Monday to Sunday (Irish time). Period buttons pick whole weeks.
+const PERIODS = {
+  week: { label: 'This week', weeksBack: 0, last: false },
+  last: { label: 'Last week', weeksBack: 1, last: true },
+  w4: { label: 'Last 4 weeks', weeksBack: 3, last: false },
+  w12: { label: 'Last 12 weeks', weeksBack: 11, last: false },
+};
+const WEEKS_SHOWN = 12;  // rows in the weekly table (also the oldest day loaded)
+
+const state = { period: 'week', selection: ALL_WASHERS, devices: [], chartArgs: null };
 const $ = (id) => document.getElementById(id);
 
 // ---------------------------------------------------------------------------
@@ -31,10 +40,35 @@ const fmtL = (v) => {
 };
 const fmtAxis = (v) => (v >= 10000 ? `${nf1.format(v / 1000)} m³` : `${nf0.format(v)} L`);
 const dtFmt = new Intl.DateTimeFormat('en-IE', { timeZone: TIME_ZONE, day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+const nfInt = new Intl.NumberFormat('en-IE', { maximumFractionDigits: 0, useGrouping: false });
+const fmtCount = (v) => (v == null || Number.isNaN(Number(v)) ? '–' : nfInt.format(Number(v)));
 const dayKey = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: TIME_ZONE }).format(d); // YYYY-MM-DD
+const keyDate = (key) => new Date(`${key}T12:00:00Z`);
 const fmtDay = (key, short) => new Intl.DateTimeFormat('en-IE', short
   ? { day: 'numeric', month: 'short', timeZone: 'UTC' }
-  : { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }).format(new Date(`${key}T12:00:00Z`));
+  : { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }).format(keyDate(key));
+const fmtWeekday = (key) => new Intl.DateTimeFormat('en-IE', { weekday: 'short', day: 'numeric', timeZone: 'UTC' }).format(keyDate(key));
+const fmtShort = (key) => new Intl.DateTimeFormat('en-IE', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' }).format(keyDate(key));
+const fmtRange = (from, to) => `${fmtShort(from)} – ${fmtShort(to)}`;
+
+// Calendar days as 'YYYY-MM-DD' keys (Irish dates), so no time zone maths is needed.
+const addDays = (key, n) => {
+  const d = keyDate(key);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+const mondayOf = (key) => addDays(key, -((keyDate(key).getUTCDay() + 6) % 7));
+const todayKey = () => dayKey(new Date());
+const thisMonday = () => mondayOf(todayKey());
+
+// First and last day of the selected period (whole Monday-to-Sunday weeks).
+function periodRange(period) {
+  const p = PERIODS[period];
+  const mon = thisMonday();
+  const from = addDays(mon, -7 * p.weeksBack);
+  const to = p.last ? addDays(mon, -1) : addDays(mon, 6);
+  return { from, to };
+}
 const ago = (iso) => {
   const min = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
   if (min < 1) return 'just now';
@@ -73,13 +107,10 @@ function fillSelect() {
   sel.value = state.selection;
 }
 
-const fromDay = (days) => dayKey(new Date(Date.now() - (days - 1) * 86400000));
-
-// Every day in the period, zero-filled, summed per channel over the selected devices.
-function dailySeries(rows, days, channels) {
+// Every day from..to, zero-filled, summed per channel over the given rows.
+function dailySeries(rows, from, to, channels) {
   const map = new Map();
-  for (let i = days - 1; i >= 0; i--) {
-    const key = dayKey(new Date(Date.now() - i * 86400000));
+  for (let key = from; key <= to; key = addDays(key, 1)) {
     map.set(key, Object.fromEntries([['day', key], ...channels.map((c) => [c, 0])]));
   }
   for (const r of rows) {
@@ -89,24 +120,42 @@ function dailySeries(rows, days, channels) {
   return [...map.values()];
 }
 
+// Litres per channel used from..to (inclusive), over the given rows.
+function usageBetween(rows, from, to, channels) {
+  const out = Object.fromEntries(channels.map((c) => [c, 0]));
+  for (const r of rows) {
+    if (r.day >= from && r.day <= to && r.channel in out) out[r.channel] += Number(r.used_l) || 0;
+  }
+  return out;
+}
+const sumOf = (obj) => Object.values(obj).reduce((a, b) => a + b, 0);
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
-function renderDevices(totals, todayRows) {
+function renderDevices(totals, weekRows) {
   const box = $('devices');
   if (!state.devices.length) {
     box.innerHTML = '<p class="empty">No meters yet. They appear here after their first send.</p>';
     return;
   }
-  const today = new Map(todayRows.map((r) => [`${r.device_id}|${r.channel}`, r.used_l]));
+  const week = new Map();
+  for (const r of weekRows) {
+    const k = `${r.device_id}|${r.channel}`;
+    week.set(k, (week.get(k) || 0) + (Number(r.used_l) || 0));
+  }
   const card = (d) => {
     const mine = totals.filter((t) => t.device_id === d.id);
     const channels = sortChannels(mine.map((t) => t.channel));
     const offline = !d.last_seen || Date.now() - new Date(d.last_seen) > OFFLINE_AFTER_MIN * 60000;
-    const rows = channels.map((c) => `
+    const rows = channels.map((c) => {
+      const t = mine.find((x) => x.channel === c);
+      return `
       <span class="inlet">${swatch(c)}${esc(c)}</span>
-      <span class="num">${fmtL(mine.find((t) => t.channel === c)?.litres)}</span>
-      <span class="num">${fmtL(today.get(`${d.id}|${c}`) ?? 0)}</span>`).join('');
+      <span class="num">${fmtL(week.get(`${d.id}|${c}`) ?? 0)}</span>
+      <span class="num">${fmtL(t?.litres)}</span>
+      <span class="num counter" title="Pulses counted: should match the 7111 counter">${fmtCount(t?.pulses)}</span>`;
+    }).join('');
     return `
       <article class="card${String(d.id) === state.selection ? ' selected' : ''}" data-id="${d.id}" tabindex="0" role="button" aria-label="Show ${esc(d.name)}">
         <div class="card-head">
@@ -114,8 +163,8 @@ function renderDevices(totals, todayRows) {
           <span class="status ${offline ? 'off' : ''}">${d.last_seen ? (offline ? 'Offline · ' : '') + ago(d.last_seen) : 'never'}</span>
         </div>
         <div class="inlets">
-          <span class="hdr">Meter</span><span class="hdr num">Total</span><span class="hdr num">Today</span>
-          ${rows || '<span class="muted small">No readings yet</span><span></span><span></span>'}
+          <span class="hdr">Meter</span><span class="hdr num" title="Monday to Sunday">This week</span><span class="hdr num" title="Accumulated since installed">Total</span><span class="hdr num" title="Pulses counted: compare with the 7111">Counter</span>
+          ${rows || '<span class="muted small">No readings yet</span><span></span><span></span><span></span>'}
         </div>
         <div class="card-foot">Wi-Fi ${d.rssi ?? '–'} dBm · firmware ${esc(d.fw || '–')}</div>
       </article>`;
@@ -132,16 +181,62 @@ function renderDevices(totals, todayRows) {
   });
 }
 
-function renderDaily(series, channels) {
+// Tiles for the selection: today, this week, last week, accumulated total (and counters for one meter).
+function renderSummary(rows, totals, ids, channels) {
+  const today = todayKey();
+  const mon = thisMonday();
+  const breakdown = (obj, fmt = fmtL) => (channels.length > 1 || fmt !== fmtL
+    ? `<div class="tile-rows">${channels.map((c) => `<span class="pair">${swatch(c)}${fmt(obj[c])}</span>`).join('')}</div>`
+    : '');
+  const tile = (label, sub, obj) => `<div class="tile">
+      <div class="tile-label">${label}</div><div class="tile-sub">${sub}</div>
+      <div class="tile-value">${fmtL(sumOf(obj))}</div>${breakdown(obj)}</div>`;
+
+  const mine = totals.filter((t) => ids.includes(t.device_id));
+  const acc = Object.fromEntries(channels.map((c) => [c, mine.filter((t) => t.channel === c).reduce((s, t) => s + (Number(t.litres) || 0), 0)]));
+  let html = tile('Today', fmtShort(today), usageBetween(rows, today, today, channels)) +
+    tile('This week', fmtRange(mon, addDays(mon, 6)), usageBetween(rows, mon, today, channels)) +
+    tile('Last week', fmtRange(addDays(mon, -7), addDays(mon, -1)), usageBetween(rows, addDays(mon, -7), addDays(mon, -1), channels)) +
+    tile('Accumulated', 'total since installed', acc);
+  if (ids.length === 1) {
+    const counters = Object.fromEntries(channels.map((c) => [c, mine.find((t) => t.channel === c)?.pulses]));
+    html += `<div class="tile">
+      <div class="tile-label">Counter</div><div class="tile-sub">compare with the 7111</div>
+      <div class="tile-rows big">${channels.map((c) => `<span class="pair">${swatch(c)}<span class="counter">${fmtCount(counters[c])}</span></span>`).join('')}</div></div>`;
+  }
+  $('summary-title').textContent = `Summary · ${selectionLabel()}`;
+  $('summary').innerHTML = html;
+}
+
+// One row per Monday-to-Sunday week, newest first.
+function renderWeekly(rows, channels) {
+  const mon = thisMonday();
+  const weeks = [];
+  for (let i = 0; i < WEEKS_SHOWN; i++) {
+    const from = addDays(mon, -7 * i);
+    const to = addDays(from, 6);
+    weeks.push({ from, to, use: usageBetween(rows, from, to, channels) });
+  }
+  const multi = channels.length > 1;
+  $('weekly-title').textContent = `Weekly usage (Monday to Sunday) · ${selectionLabel()}`;
+  $('weekly').innerHTML = `<table>
+    <thead><tr><th>Week</th>${channels.map((c) => `<th class="num">${esc(c)}</th>`).join('')}${multi ? '<th class="num">Total</th>' : ''}</tr></thead>
+    <tbody>${weeks.map((w, i) => `<tr${i === 0 ? ' class="current"' : ''}><td>${fmtRange(w.from, w.to)}${i === 0 ? ' <span class="muted small">(this week, so far)</span>' : ''}</td>${channels.map((c) => `<td class="num">${fmtL(w.use[c])}</td>`).join('')}${multi ? `<td class="num"><b>${fmtL(sumOf(w.use))}</b></td>` : ''}</tr>`).join('')}</tbody>
+  </table>`;
+}
+
+function renderDaily(series, channels, range) {
   const seriesDef = channels.map((c) => ({ key: c, label: c, cssVar: channelVar(c) }));
-  state.chartArgs = { rows: series, series: seriesDef, formatValue: fmtAxis, formatDay: fmtDay };
+  const oneWeek = series.length <= 7;
+  const tick = (key, short) => (short ? (oneWeek ? fmtWeekday(key) : fmtDay(key, true)) : fmtDay(key));
+  state.chartArgs = { rows: series, series: seriesDef, formatValue: fmtAxis, formatDay: tick };
   $('daily-title').textContent = `Daily usage · ${selectionLabel()}`;
   $('legend').innerHTML = channels.length > 1 ? channels.map((c) => `<span>${swatch(c)}${esc(c)}</span>`).join('') : '';
   renderStackedBars($('chart'), state.chartArgs);
 
   const sums = Object.fromEntries(channels.map((c) => [c, series.reduce((s, r) => s + r[c], 0)]));
   const all = Object.values(sums).reduce((a, b) => a + b, 0);
-  $('period-total').textContent = `Last ${state.days} days: ${fmtL(all)}` +
+  $('period-total').textContent = `${PERIODS[state.period].label} (${fmtRange(range.from, range.to)}): ${fmtL(all)}` +
     (channels.length > 1 ? ` (${channels.map((c) => `${c.toLowerCase()} ${fmtL(sums[c])}`).join(', ')}).` : '.');
 
   $('daily-table').innerHTML = `<table>
@@ -165,13 +260,13 @@ function renderRecent(rows) {
   const cell = (ch, field) => sortChannels(ch.map((c) => c.channel)).map((name) => {
     const c = ch.find((x) => x.channel === name);
     const v = c[field];
-    return `<span class="pair">${swatch(name)}${v == null ? '–' : fmtL(v)}</span>`;
+    return `<span class="pair">${swatch(name)}${field === 'pulses' ? fmtCount(v) : v == null ? '–' : fmtL(v)}</span>`;
   }).join('');
   $('recent').innerHTML = `<table>
-    <thead><tr><th>Time</th><th>Meter</th><th>Totals</th><th>Used since previous</th></tr></thead>
+    <thead><tr><th>Time</th><th>Meter</th><th>Totals</th><th>Counter (7111)</th><th>Used since previous</th></tr></thead>
     <tbody>${list.map((r) => `<tr>
       <td>${dtFmt.format(new Date(r.created_at))}</td><td>${esc(names.get(r.device_id) || r.device_id)}</td>
-      <td>${cell(r.ch, 'litres')}</td><td>${cell(r.ch, 'used_l')}</td></tr>`).join('')}</tbody>
+      <td>${cell(r.ch, 'litres')}</td><td>${cell(r.ch, 'pulses')}</td><td>${cell(r.ch, 'used_l')}</td></tr>`).join('')}</tbody>
   </table>`;
 }
 
@@ -188,15 +283,19 @@ async function load() {
     fillSelect();
     const ids = selectedDevices().map((d) => d.id);
     const allIds = state.devices.map((d) => d.id);
-    const [totals, todayRows, daily, recent] = await Promise.all([
+    const mon = thisMonday();
+    const [totals, weekRows, daily, recent] = await Promise.all([
       api.latestTotals(allIds),
-      api.dailyUsage({ fromDay: dayKey(new Date()), ids: allIds }),
-      ids.length ? api.dailyUsage({ fromDay: fromDay(state.days), ids }) : [],
+      api.dailyUsage({ fromDay: mon, ids: allIds }),
+      ids.length ? api.dailyUsage({ fromDay: addDays(mon, -7 * (WEEKS_SHOWN - 1)), ids }) : [],
       ids.length ? api.channelUsage({ ids, limit: 300 }) : [],
     ]);
     const channels = sortChannels(new Set(totals.filter((t) => ids.includes(t.device_id)).map((t) => t.channel)));
-    renderDevices(totals, todayRows);
-    renderDaily(dailySeries(daily, state.days, channels), channels);
+    const range = periodRange(state.period);
+    renderDevices(totals, weekRows);
+    renderSummary(daily, totals, ids, channels);
+    renderDaily(dailySeries(daily, range.from, range.to, channels), channels, range);
+    renderWeekly(daily, channels);
     renderRecent(recent);
     notice('');
     $('updated').textContent = dtFmt.format(new Date());
@@ -212,7 +311,7 @@ async function exportCsv() {
   btn.disabled = true;
   try {
     const devices = new Map(state.devices.map((d) => [d.id, d]));
-    const since = new Date(`${fromDay(state.days)}T00:00:00Z`).toISOString();
+    const since = new Date(`${addDays(periodRange(state.period).from, -1)}T23:00:00Z`).toISOString();  // covers Irish midnight in summer and winter
     const ids = selectedDevices().map((d) => d.id);
     const rows = [];
     for (let offset = 0; ; offset += 1000) {
@@ -224,9 +323,9 @@ async function exportCsv() {
     const local = new Intl.DateTimeFormat('sv-SE', { timeZone: TIME_ZONE, dateStyle: 'short', timeStyle: 'medium' });
     const lines = rows.reverse().map((r) => {
       const d = devices.get(r.device_id) || {};
-      return [local.format(new Date(r.created_at)), d.name, d.kind, r.channel, r.litres, r.used_l].map(cell).join(',');
+      return [local.format(new Date(r.created_at)), d.name, d.kind, r.channel, r.litres, r.pulses, r.used_l].map(cell).join(',');
     });
-    const csv = ['time,meter,kind,channel,total_l,used_l', ...lines].join('\n');
+    const csv = ['time,meter,kind,channel,total_l,counter_pulses,used_l', ...lines].join('\n');
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
     a.download = `water-readings-${dayKey(new Date())}.csv`;
@@ -247,7 +346,7 @@ $('refresh').addEventListener('click', load);
 $('export').addEventListener('click', exportCsv);
 document.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => {
   document.querySelectorAll('.seg button').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
-  state.days = Number(b.dataset.days);
+  state.period = b.dataset.period;
   load();
 }));
 $('toggle-table').addEventListener('click', (e) => {

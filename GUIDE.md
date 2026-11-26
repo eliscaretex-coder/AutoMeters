@@ -89,9 +89,12 @@ To get back into SETUP mode later, **hold the screen (the button) for 5 seconds*
 
 ## 5. Day-to-day use
 
-- **Screen:** machine name and the litres for **C**old, **W**arm and **H**ot. A dot flashes for every pulse received.
+- **Screen:** machine name and, for **C**old, **W**arm and **H**ot:
+  - top line, large: litres used **this week** (Monday 00:00 to Sunday 24:00, Irish time). It comes from Supabase, so it is the same number as the web page and survives restarts. It shows `--` until the Atom has the time and has sent its first reading.
+  - bottom line: the **total** litres (accumulated) on the left and, in amber on the right, the **counter**: the number of pulses, to compare with the number on the 7111.
+  - A dot flashes for every pulse received.
+- **Gateway screen (no meters on the Atom):** the first page lists the machines with the litres used this week. Tap the screen to see one machine at a time with the same three numbers per inlet.
 - **Screen off:** the screen turns off after 60 s without a press (change it in the settings; 0 = always on). Press it once to wake it up. Counting and sending carry on with the screen off.
-- **Quick tap on the screen:** switches between litres and **pulses** (to compare with the number on the 7111).
 - **Footer:** time of the last send in green, or the error in orange (`no Wi-Fi`, `no API key`, `wrong token`, `error -1`...).
 - It sends every 60 minutes (this can be changed). Because the Atom always sends the **running total**, nothing is lost if the Wi-Fi drops: the usage for that period goes into the next send.
 - The count is saved every 30 s. In a power cut, at most the last 30 s of pulses are lost.

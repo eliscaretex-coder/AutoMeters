@@ -24,13 +24,20 @@
         <select id="machine"><option value="washers">All washing machines</option></select>
       </label>
       <div class="seg" role="radiogroup" aria-label="Period">
-        <button type="button" data-days="7">7 days</button>
-        <button type="button" data-days="30" aria-pressed="true">30 days</button>
-        <button type="button" data-days="90">90 days</button>
+        <button type="button" data-period="week" aria-pressed="true">This week</button>
+        <button type="button" data-period="last">Last week</button>
+        <button type="button" data-period="w4">4 weeks</button>
+        <button type="button" data-period="w12">12 weeks</button>
       </div>
       <span class="spacer"></span>
       <button type="button" id="refresh" class="ghost">Refresh</button>
       <button type="button" id="export" class="ghost">Download CSV</button>
+    </section>
+
+    <section aria-labelledby="summary-title">
+      <h2 id="summary-title">Summary</h2>
+      <div id="summary" class="tiles"></div>
+      <p class="muted small">Weeks run Monday to Sunday (Irish time). The counter is the number of pulses counted: it should match the 7111 counter on the machine.</p>
     </section>
 
     <section aria-labelledby="h-devices">
@@ -47,6 +54,11 @@
       <div id="chart" class="chart"></div>
       <div id="daily-table" class="table-wrap" hidden></div>
       <p id="period-total" class="muted"></p>
+    </section>
+
+    <section aria-labelledby="weekly-title" class="panel">
+      <h2 id="weekly-title">Weekly usage (Monday to Sunday)</h2>
+      <div id="weekly" class="table-wrap"></div>
     </section>
 
     <section aria-labelledby="h-recent" class="panel">
