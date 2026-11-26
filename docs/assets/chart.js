@@ -21,7 +21,7 @@ function topRounded(x, y, w, h, r) {
   return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
 }
 
-export function renderStackedBars(container, { rows, series, formatValue, formatDay }) {
+export function renderStackedBars(container, { rows, series, formatValue, formatDay, onPick, ariaLabel }) {
   container.replaceChildren();
   const width = Math.max(container.clientWidth, 280);
   const height = 260;
@@ -34,7 +34,7 @@ export function renderStackedBars(container, { rows, series, formatValue, format
   const y = (v) => m.top + ih - (v / max) * ih;
 
   const svg = el('svg', { viewBox: `0 0 ${width} ${height}`, width, height, role: 'img' });
-  svg.setAttribute('aria-label', 'Daily water usage, stacked by inlet');
+  svg.setAttribute('aria-label', ariaLabel || 'Daily water usage, stacked by inlet');
 
   // Grid and y labels
   for (let i = 0; i <= 4; i++) {
@@ -104,6 +104,7 @@ export function renderStackedBars(container, { rows, series, formatValue, format
     const hide = () => { g.classList.remove('active'); tip.hidden = true; };
     hit.addEventListener('pointerenter', show);
     hit.addEventListener('pointerleave', hide);
-    hit.addEventListener('click', show);
+    hit.addEventListener('click', () => { show(); if (onPick) onPick(r); });
+    if (onPick) hit.style.cursor = 'pointer';
   });
 }

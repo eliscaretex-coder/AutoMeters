@@ -54,6 +54,21 @@
       <div id="chart" class="chart"></div>
       <div id="daily-table" class="table-wrap" hidden></div>
       <p id="period-total" class="muted"></p>
+      <p class="muted small">Click a day to see it hour by hour below.</p>
+    </section>
+
+    <section aria-labelledby="dayview-title" class="panel">
+      <div class="panel-head">
+        <h2 id="dayview-title">During the day</h2>
+        <label class="day-pick">Day <input type="date" id="day"></label>
+        <button type="button" id="day-prev" class="ghost" aria-label="Previous day">‹</button>
+        <button type="button" id="day-next" class="ghost" aria-label="Next day">›</button>
+        <div id="day-legend" class="legend"></div>
+        <button type="button" id="toggle-day-table" class="link">Show as table</button>
+      </div>
+      <div id="day-chart" class="chart"></div>
+      <div id="day-table" class="table-wrap" hidden></div>
+      <p id="day-total" class="muted"></p>
     </section>
 
     <section aria-labelledby="weekly-title" class="panel">
