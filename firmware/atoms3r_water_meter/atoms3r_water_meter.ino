@@ -616,8 +616,15 @@ static bool supabaseGet(const String &pathAndQuery, JsonDocument &doc) {
   return ok;
 }
 
-// Entry for (mac, channel) in arr, added when missing. Returns the channel slot or -1.
-static int weekSlot(WeekInfo *arr, int &count, const char *mac, const char *ch) {
+// Built by fetchWeek(), then copied into weekInfo
+static WeekInfo weekTmp[MAX_WEEK];
+static int weekTmpCount = 0;
+
+// Entry for (mac, channel) in weekTmp, added when missing. Returns the channel slot or -1.
+// (No WeekInfo in the parameters: the Arduino IDE declares functions before the struct.)
+static int weekSlot(const char *mac, const char *ch) {
+  WeekInfo *arr = weekTmp;
+  int &count = weekTmpCount;
   int i = 0;
   for (; i < count; i++) if (strcmp(arr[i].mac, mac) == 0) break;
   if (i == count) {
@@ -636,8 +643,8 @@ static int weekSlot(WeekInfo *arr, int &count, const char *mac, const char *ch) 
 static bool fetchWeek() {
   char mon[11];
   if (!mondayKey(mon)) return false;
-  static WeekInfo tmp[MAX_WEEK];
-  int count = 0;
+  WeekInfo *tmp = weekTmp;
+  weekTmpCount = 0;
 
   // device id -> MAC
   JsonDocument devs;
@@ -652,7 +659,7 @@ static bool fetchWeek() {
   for (JsonObject r : doc.as<JsonArray>()) {
     const char *mac = macOf(r["device_id"].as<long>());
     if (!*mac) continue;
-    int s = weekSlot(tmp, count, mac, r["channel"] | "Water");
+    int s = weekSlot(mac, r["channel"] | "Water");
     if (s >= 0) tmp[s / LINK_MAX_CH].litres[s % LINK_MAX_CH] += r["used_l"].as<double>();
   }
   doc.clear();
@@ -660,18 +667,18 @@ static bool fetchWeek() {
   for (JsonObject r : doc.as<JsonArray>()) {
     const char *mac = macOf(r["device_id"].as<long>());
     if (!*mac || r["pulses"].isNull()) continue;
-    int s = weekSlot(tmp, count, mac, r["channel"] | "Water");
+    int s = weekSlot(mac, r["channel"] | "Water");
     if (s < 0) continue;
     tmp[s / LINK_MAX_CH].pulses[s % LINK_MAX_CH] = r["pulses"].as<unsigned long long>();
     tmp[s / LINK_MAX_CH].hasPulses[s % LINK_MAX_CH] = true;
   }
 
   portENTER_CRITICAL(&weekMux);
-  memcpy(weekInfo, tmp, sizeof(WeekInfo) * count);
-  weekCount = count;
+  memcpy(weekInfo, tmp, sizeof(WeekInfo) * weekTmpCount);
+  weekCount = weekTmpCount;
   memcpy(weekStart, mon, sizeof weekStart);
   portEXIT_CRITICAL(&weekMux);
-  Serial.printf("Week from %s loaded: %d meters\n", mon, count);
+  Serial.printf("Week from %s loaded: %d meters\n", mon, weekTmpCount);
   return true;
 }
 
