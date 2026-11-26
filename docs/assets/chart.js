@@ -108,3 +108,82 @@ export function renderStackedBars(container, { rows, series, formatValue, format
     if (onPick) hit.style.cursor = 'pointer';
   });
 }
+
+// Line chart over one day: x = minutes since midnight (0..1440), y = litres.
+// series: [{ label, cssVar, points: [{ t, v }] }] with t ascending.
+// The tooltip follows the pointer and shows each line's value at that time.
+export function renderDayLines(container, { series, formatValue, formatTime, ariaLabel, endT = 1440 }) {
+  container.replaceChildren();
+  const width = Math.max(container.clientWidth, 280);
+  const height = 260;
+  const m = { top: 12, right: 12, bottom: 28, left: 52 };
+  const iw = width - m.left - m.right;
+  const ih = height - m.top - m.bottom;
+  const max = niceMax(Math.max(0, ...series.flatMap((s) => s.points.map((p) => p.v))));
+  const x = (t) => m.left + (t / 1440) * iw;
+  const y = (v) => m.top + ih - (v / max) * ih;
+
+  const svg = el('svg', { viewBox: `0 0 ${width} ${height}`, width, height, role: 'img' });
+  svg.setAttribute('aria-label', ariaLabel || 'Water used during the day');
+  for (let i = 0; i <= 4; i++) {
+    const v = (max / 4) * i;
+    svg.append(el('line', { x1: m.left, x2: width - m.right, y1: y(v), y2: y(v), class: i ? 'grid' : 'axis' }));
+    const t = el('text', { x: m.left - 6, y: y(v) + 4, 'text-anchor': 'end', class: 'tick' });
+    t.textContent = formatValue(v);
+    svg.append(t);
+  }
+  const every = iw < 420 ? 360 : 180;
+  for (let t = 0; t <= 1440; t += every) {
+    const lab = el('text', { x: x(t), y: height - 8, 'text-anchor': t === 0 ? 'start' : t === 1440 ? 'end' : 'middle', class: 'tick' });
+    lab.textContent = formatTime(t);
+    svg.append(lab);
+  }
+
+  for (const s of series) {
+    if (!s.points.length) continue;
+    const d = s.points.map((p, i) => `${i ? 'L' : 'M'}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join('');
+    svg.append(el('path', { d, fill: 'none', stroke: `var(${s.cssVar})`, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+  }
+
+  // Hover: vertical guide and a dot per line
+  const guide = el('line', { y1: m.top, y2: m.top + ih, class: 'axis', visibility: 'hidden' });
+  const dots = series.map((s) => el('circle', { r: 4, fill: `var(${s.cssVar})`, stroke: 'var(--surface)', 'stroke-width': 2, visibility: 'hidden' }));
+  svg.append(guide, ...dots);
+  const hit = el('rect', { x: m.left, y: m.top, width: iw, height: ih, fill: 'transparent' });
+  svg.append(hit);
+
+  const tip = document.createElement('div');
+  tip.className = 'tooltip';
+  tip.hidden = true;
+  container.append(svg, tip);
+
+  const valueAt = (pts, t) => {
+    if (!pts.length || t < pts[0].t) return 0;
+    for (let i = 1; i < pts.length; i++) {
+      if (t <= pts[i].t) {
+        const a = pts[i - 1]; const b = pts[i];
+        return b.t === a.t ? b.v : a.v + ((b.v - a.v) * (t - a.t)) / (b.t - a.t);
+      }
+    }
+    return pts[pts.length - 1].v;
+  };
+  const move = (ev) => {
+    const r = svg.getBoundingClientRect();
+    const px = ((ev.clientX - r.left) / r.width) * width;
+    const t = Math.max(0, Math.min(endT, ((px - m.left) / iw) * 1440));
+    const vals = series.map((s) => valueAt(s.points, t));
+    guide.setAttribute('x1', x(t)); guide.setAttribute('x2', x(t)); guide.setAttribute('visibility', 'visible');
+    dots.forEach((c, i) => { c.setAttribute('cx', x(t)); c.setAttribute('cy', y(vals[i])); c.setAttribute('visibility', 'visible'); });
+    tip.innerHTML = `<div class="tip-title">Used by ${formatTime(Math.round(t))}</div>` + series
+      .map((s, i) => `<div class="tip-row"><span class="swatch" style="background:var(${s.cssVar})"></span>${s.label}<b>${formatValue(vals[i])}</b></div>`).join('') +
+      (series.length > 1 ? `<div class="tip-row total">Total<b>${formatValue(vals.reduce((a, b) => a + b, 0))}</b></div>` : '');
+    tip.hidden = false;
+    const right = x(t) + 12;
+    tip.style.left = `${right + tip.offsetWidth <= width ? right : Math.max(0, x(t) - 12 - tip.offsetWidth)}px`;
+    tip.style.top = `${m.top}px`;
+  };
+  const hide = () => { tip.hidden = true; guide.setAttribute('visibility', 'hidden'); dots.forEach((c) => c.setAttribute('visibility', 'hidden')); };
+  hit.addEventListener('pointermove', move);
+  hit.addEventListener('pointerdown', move);
+  hit.addEventListener('pointerleave', hide);
+}

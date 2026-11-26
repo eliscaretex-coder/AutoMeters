@@ -1,6 +1,6 @@
 import { TIME_ZONE, OFFLINE_AFTER_MIN } from './config.js';
 import * as api from './api.js';
-import { renderStackedBars } from './chart.js';
+import { renderStackedBars, renderDayLines } from './chart.js';
 
 // Known meter inputs, in a fixed order with fixed colors (same as the Atom screen).
 // Any other channel name (e.g. "Water" on the boiler or canteen meter) uses --water.
@@ -274,12 +274,15 @@ function renderRecent(rows) {
 }
 
 // ---------------------------------------------------------------------------
-// One day, hour by hour
-// Each reading's usage (since the previous reading) goes into the hour the
-// reading was sent, so the detail depends on how often the meter sends.
+// One day: litres used since midnight, one line per inlet
+// Each reading adds the usage since the previous reading at the time it was
+// sent, so the detail depends on how often the meter sends.
 // ---------------------------------------------------------------------------
-const hourOf = (iso) => Number(new Intl.DateTimeFormat('en-GB', { timeZone: TIME_ZONE, hour: '2-digit', hourCycle: 'h23' }).format(new Date(iso)));
+const hmFmt = new Intl.DateTimeFormat('en-GB', { timeZone: TIME_ZONE, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+const minuteOf = (iso) => { const [h, mi] = hmFmt.format(new Date(iso)).split(':').map(Number); return h * 60 + mi; };
+const hourOf = (iso) => Math.floor(minuteOf(iso) / 60);
 const hourLabel = (h) => `${String(h).padStart(2, '0')}:00`;
+const timeLabel = (t) => `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;  // 1440 -> 24:00
 
 async function loadDay() {
   const day = state.day || todayKey();
@@ -308,20 +311,30 @@ async function loadDay() {
       const t = hours[hourOf(r.created_at)];
       if (t && r.channel in t) t[r.channel] += Number(r.used_l) || 0;
     }
-    const seriesDef = channels.map((c) => ({ key: c, label: c, cssVar: channelVar(c) }));
-    state.dayArgs = {
-      rows: hours, series: seriesDef, formatValue: fmtAxis,
-      formatDay: (h, short) => (short ? hourLabel(h) : `${fmtShort(day)}, ${hourLabel(h)}–${hourLabel((h + 1) % 24)}`),
-      ariaLabel: 'Water usage per hour, stacked by inlet',
-    };
+    // Running total since midnight per inlet (all selected meters added up)
+    const isToday = day === todayKey();
+    const endT = isToday ? minuteOf(new Date().toISOString()) : 1440;
+    const ordered = [...mine].sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
+    const lineSeries = channels.map((c) => {
+      const points = [{ t: 0, v: 0 }];
+      let acc = 0;
+      for (const r of ordered) {
+        if (r.channel !== c) continue;
+        acc += Number(r.used_l) || 0;
+        points.push({ t: minuteOf(r.created_at), v: acc });
+      }
+      points.push({ t: endT, v: acc });
+      return { label: c, cssVar: channelVar(c), points };
+    });
+    state.dayArgs = { series: lineSeries, formatValue: fmtAxis, formatTime: timeLabel, endT, ariaLabel: 'Litres used since midnight, one line per inlet' };
     $('day-legend').innerHTML = channels.length > 1 ? channels.map((c) => `<span>${swatch(c)}${esc(c)}</span>`).join('') : '';
-    renderStackedBars($('day-chart'), state.dayArgs);
+    renderDayLines($('day-chart'), state.dayArgs);
 
     const sums = Object.fromEntries(channels.map((c) => [c, hours.reduce((a, r) => a + r[c], 0)]));
     const readings = new Set(mine.map((r) => r.reading_id)).size;
     $('day-total').textContent = `${fmtDay(day)}: ${fmtL(sumOf(sums))}` +
       (channels.length > 1 ? ` (${channels.map((c) => `${c.toLowerCase()} ${fmtL(sums[c])}`).join(', ')})` : '') +
-      ` · ${readings} reading${readings === 1 ? '' : 's'}. Usage is counted in the hour each reading was sent.`;
+      ` · ${readings} reading${readings === 1 ? '' : 's'}. The lines show the litres used since midnight; each step is a reading sent by the meter.`;
 
     const multi = channels.length > 1;
     const used = hours.filter((r) => channels.some((c) => r[c] > 0));
@@ -442,7 +455,7 @@ window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
     if (state.chartArgs) renderStackedBars($('chart'), state.chartArgs);
-    if (state.dayArgs) renderStackedBars($('day-chart'), state.dayArgs);
+    if (state.dayArgs) renderDayLines($('day-chart'), state.dayArgs);
   }, 200);
 });
 setInterval(load, 5 * 60 * 1000);
