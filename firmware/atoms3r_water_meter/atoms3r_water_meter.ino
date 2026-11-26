@@ -41,7 +41,7 @@
 #include <freertos/queue.h>
 #include "supabase_roots.h"
 
-#define FW_VERSION "2.3.0"
+#define FW_VERSION "2.3.1"
 
 // ----------------------------------------------------------------------------
 // Supabase project, publishable key and ingest token
@@ -1015,9 +1015,10 @@ static M5Canvas canvas(&M5.Display);
 static uint16_t chColor[NUM_CH];
 static const uint16_t COUNTER_COLOR = 0xFE60;  // amber, like the 7111 digits
 
+// Always whole litres, so the three inlets use the same unit.
 static String fmtLitres(double l) {
-  if (l < 100000.0) return String((unsigned long)(l + 0.5)) + " L";
-  return String(l / 1000.0, 1) + " m3";
+  if (l < 0) l = 0;
+  return String((unsigned long)(l + 0.5)) + " L";
 }
 
 // One inlet row, 28 px high:
