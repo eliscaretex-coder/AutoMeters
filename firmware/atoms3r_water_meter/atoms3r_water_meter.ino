@@ -15,6 +15,10 @@
 //  screen lists the readers. Tick "This Atom also reads a machine" on the
 //  settings page to count its own 3 inlets as well.
 //
+//  Screen, per inlet: litres used this week (Monday to Sunday, from
+//  Supabase, the same numbers as the web page), the total litres and the
+//  counter (pulses, the number to compare with the 7111).
+//
 //  Gateway: the Atom listens for the battery meter readers (XIAO
 //  ESP32-C6) over ESP-NOW, answers them and forwards their readings to
 //  Supabase. The readers find the Atom's Wi-Fi channel by themselves; both
@@ -37,7 +41,7 @@
 #include <freertos/queue.h>
 #include "supabase_roots.h"
 
-#define FW_VERSION "2.2.0"
+#define FW_VERSION "2.3.0"
 
 // ----------------------------------------------------------------------------
 // Supabase project, publishable key and ingest token
@@ -295,6 +299,10 @@ static bool lastSendOk = false;
 static uint32_t sendSeq = 0;
 static uint32_t bootId = 0;
 
+// This week's usage is read back from Supabase after uploads (see "This week" below)
+static volatile bool weekDirty = true;     // fetch again soon
+static volatile uint32_t weekDirtyMs = 0;  // when it became dirty
+
 static String twoDigits(int v) { return (v < 10 ? "0" : "") + String(v); }
 
 static String clockStr(time_t t) {
@@ -334,6 +342,8 @@ static bool postReading(JsonDocument &doc, String &msg) {
   bool ok = code == 200 && (resp.indexOf("\"ok\":true") >= 0 || resp.indexOf("\"ok\": true") >= 0);
   if (ok) {
     msg = "sent " + clockStr(time(nullptr));
+    weekDirty = true;
+    weekDirtyMs = millis();
   } else {
     if (resp.indexOf("\"token\"") >= 0) msg = "wrong token";
     else if (code == 401) msg = "wrong API key";
@@ -384,6 +394,7 @@ struct NodeInfo {
   uint16_t battMv;
   uint8_t nch;
   uint8_t enabled[LINK_MAX_CH];
+  char chName[LINK_MAX_CH][9];
   uint64_t pulses[LINK_MAX_CH];
   float lpp[LINK_MAX_CH];
   char status[24];
@@ -481,6 +492,8 @@ static void gatewayTask(void *) {
     n.nch = it.r.nch;
     for (int c = 0; c < n.nch; c++) {
       n.enabled[c] = it.r.ch[c].enabled;
+      memcpy(n.chName[c], it.r.ch[c].name, 8);
+      n.chName[c][8] = 0;
       n.pulses[c] = it.r.ch[c].pulses;
       n.lpp[c] = it.r.ch[c].lpp;
     }
@@ -542,6 +555,163 @@ static void uploadNodeReadings() {
   }
 }
 
+// ----------------------------------------------------------------------------
+// This week (Monday 00:00 to Sunday 24:00, local time)
+// The litres used this week come from Supabase (view daily_usage, the same
+// numbers as the web page), so they survive restarts and match the page.
+// Between fetches the screen adds the pulses counted since the last reading
+// the server has (view latest_totals).
+// ----------------------------------------------------------------------------
+struct WeekInfo {
+  char mac[18];
+  uint8_t nch;
+  char ch[LINK_MAX_CH][9];
+  double litres[LINK_MAX_CH];    // used this week, up to the server's last reading
+  uint64_t pulses[LINK_MAX_CH];  // counter in the server's last reading
+  bool hasPulses[LINK_MAX_CH];
+};
+static const int MAX_WEEK = 40;
+static WeekInfo weekInfo[MAX_WEEK];
+static int weekCount = 0;
+static char weekStart[11] = "";   // Monday of the loaded week ("" = not loaded yet)
+static portMUX_TYPE weekMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t weekFetchedMs = 0, weekTriedMs = 0;
+static const uint32_t WEEK_REFRESH_MS = 30UL * 60 * 1000;  // also refresh every 30 min
+static const uint32_t WEEK_RETRY_MS = 60UL * 1000;
+
+// Monday of the current week as YYYY-MM-DD (local time). False until the clock is set.
+static bool mondayKey(char out[11]) {
+  time_t now = time(nullptr);
+  if (now < 1600000000) return false;
+  struct tm t;
+  localtime_r(&now, &t);
+  t.tm_mday -= (t.tm_wday + 6) % 7;  // tm_wday: 0 = Sunday
+  t.tm_hour = 12;                    // midday: safe on clock-change days
+  t.tm_min = t.tm_sec = 0;
+  t.tm_isdst = -1;
+  time_t mon = mktime(&t);
+  localtime_r(&mon, &t);
+  strftime(out, 11, "%Y-%m-%d", &t);
+  return true;
+}
+
+static bool supabaseGet(const String &pathAndQuery, JsonDocument &doc) {
+  if (cfg.url.isEmpty() || cfg.key.isEmpty()) return false;
+  String url = cfg.url;
+  while (url.endsWith("/")) url.remove(url.length() - 1);
+  url += "/rest/v1/" + pathAndQuery;
+  WiFiClientSecure client;
+  client.setCACert(SUPABASE_ROOT_CAS);
+  HTTPClient http;
+  http.setTimeout(20000);
+  if (!http.begin(client, url)) return false;
+  http.addHeader("apikey", cfg.key);
+  if (cfg.key.startsWith("eyJ")) http.addHeader("Authorization", "Bearer " + cfg.key);
+  http.addHeader("Accept", "application/json");
+  int code = http.GET();
+  bool ok = false;
+  if (code == 200) ok = !deserializeJson(doc, http.getString()) && doc.is<JsonArray>();
+  else Serial.printf("Week fetch: HTTP %d for %s\n", code, pathAndQuery.c_str());
+  http.end();
+  return ok;
+}
+
+// Entry for (mac, channel) in arr, added when missing. Returns the channel slot or -1.
+static int weekSlot(WeekInfo *arr, int &count, const char *mac, const char *ch) {
+  int i = 0;
+  for (; i < count; i++) if (strcmp(arr[i].mac, mac) == 0) break;
+  if (i == count) {
+    if (count >= MAX_WEEK) return -1;
+    memset(&arr[i], 0, sizeof arr[i]);
+    strncpy(arr[i].mac, mac, sizeof arr[i].mac - 1);
+    count++;
+  }
+  WeekInfo &w = arr[i];
+  for (int c = 0; c < w.nch; c++) if (strncmp(w.ch[c], ch, 8) == 0) return i * LINK_MAX_CH + c;
+  if (w.nch >= LINK_MAX_CH) return -1;
+  strncpy(w.ch[w.nch], ch, 8);
+  return i * LINK_MAX_CH + w.nch++;
+}
+
+static bool fetchWeek() {
+  char mon[11];
+  if (!mondayKey(mon)) return false;
+  static WeekInfo tmp[MAX_WEEK];
+  int count = 0;
+
+  // device id -> MAC
+  JsonDocument devs;
+  if (!supabaseGet("devices?select=id,mac", devs)) return false;
+  auto macOf = [&](long id) -> const char * {
+    for (JsonObject d : devs.as<JsonArray>()) if (d["id"].as<long>() == id) return d["mac"] | "";
+    return "";
+  };
+
+  JsonDocument doc;
+  if (!supabaseGet(String("daily_usage?select=device_id,channel,used_l&day=gte.") + mon, doc)) return false;
+  for (JsonObject r : doc.as<JsonArray>()) {
+    const char *mac = macOf(r["device_id"].as<long>());
+    if (!*mac) continue;
+    int s = weekSlot(tmp, count, mac, r["channel"] | "Water");
+    if (s >= 0) tmp[s / LINK_MAX_CH].litres[s % LINK_MAX_CH] += r["used_l"].as<double>();
+  }
+  doc.clear();
+  if (!supabaseGet("latest_totals?select=device_id,channel,pulses", doc)) return false;
+  for (JsonObject r : doc.as<JsonArray>()) {
+    const char *mac = macOf(r["device_id"].as<long>());
+    if (!*mac || r["pulses"].isNull()) continue;
+    int s = weekSlot(tmp, count, mac, r["channel"] | "Water");
+    if (s < 0) continue;
+    tmp[s / LINK_MAX_CH].pulses[s % LINK_MAX_CH] = r["pulses"].as<unsigned long long>();
+    tmp[s / LINK_MAX_CH].hasPulses[s % LINK_MAX_CH] = true;
+  }
+
+  portENTER_CRITICAL(&weekMux);
+  memcpy(weekInfo, tmp, sizeof(WeekInfo) * count);
+  weekCount = count;
+  memcpy(weekStart, mon, sizeof weekStart);
+  portEXIT_CRITICAL(&weekMux);
+  Serial.printf("Week from %s loaded: %d meters\n", mon, count);
+  return true;
+}
+
+// Called by the sender task: refresh after uploads, every 30 min and when a new week starts.
+static void maybeFetchWeek() {
+  char mon[11];
+  if (!mondayKey(mon)) return;
+  bool newWeek = strcmp(mon, weekStart) != 0;
+  bool due = newWeek || millis() - weekFetchedMs >= WEEK_REFRESH_MS ||
+             (weekDirty && millis() - weekDirtyMs >= 5000);  // let a burst of uploads finish
+  if (!due || (weekTriedMs && millis() - weekTriedMs < WEEK_RETRY_MS && !weekDirty)) return;
+  weekTriedMs = millis();
+  weekDirty = false;
+  if (fetchWeek()) weekFetchedMs = millis();
+}
+
+// Litres used this week by one inlet. pulses/lpp: what the meter counts now.
+// False when unknown (clock not set, not fetched yet, or never sent to Supabase).
+static bool weekLitres(const String &mac, const char *ch, uint64_t pulses, float lpp, double &out) {
+  char mon[11];
+  if (!mondayKey(mon)) return false;
+  bool ok = false;
+  portENTER_CRITICAL(&weekMux);
+  if (strcmp(mon, weekStart) == 0) {
+    for (int i = 0; i < weekCount && !ok; i++) {
+      if (strcmp(weekInfo[i].mac, mac.c_str()) != 0) continue;
+      for (int c = 0; c < weekInfo[i].nch; c++) {
+        if (strncmp(weekInfo[i].ch[c], ch, 8) != 0) continue;
+        out = weekInfo[i].litres[c];
+        if (weekInfo[i].hasPulses[c] && pulses > weekInfo[i].pulses[c])
+          out += (double)(pulses - weekInfo[i].pulses[c]) * (double)lpp;
+        ok = true;
+        break;
+      }
+    }
+  }
+  portEXIT_CRITICAL(&weekMux);
+  return ok;
+}
+
 static void startGateway() {
   if (gatewayRunning || !cfg.gateway) return;
   WiFi.setSleep(false);  // keep the radio listening for the readers
@@ -571,6 +741,7 @@ static void sendTask(void *) {
         if (cfg.ownMeter) doSend();
       }
       uploadNodeReadings();
+      maybeFetchWeek();
     } else {
       connectedAt = 0;
     }
@@ -834,16 +1005,55 @@ static void setupServer() {
 // 128x128 screen
 // ----------------------------------------------------------------------------
 static M5Canvas canvas(&M5.Display);
-static bool showPulses = false;
 static uint16_t chColor[NUM_CH];
+static const uint16_t COUNTER_COLOR = 0xFE60;  // amber, like the 7111 digits
 
 static String fmtLitres(double l) {
   if (l < 100000.0) return String((unsigned long)(l + 0.5)) + " L";
   return String(l / 1000.0, 1) + " m3";
 }
 
-// Gateway-only screen. Page 0: one row per reader (most recent first).
-// Tap the screen: next page = one machine with its Cold / Warm / Hot litres.
+// One inlet row, 28 px high:
+//   [C]  week          1234 L     <- litres used this week (Mon-Sun)
+//        tot 45678 L   0045678    <- total litres | counter (compare with the 7111)
+static void drawInletRow(int y, int c, bool en, bool weekOk, double weekL, double totalL, uint64_t pulses, bool flash) {
+  canvas.fillRoundRect(0, y, 18, 28, 3, en ? chColor[c] : 0x4208);
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextColor(TFT_BLACK);
+  canvas.setTextDatum(MC_DATUM);
+  canvas.drawString(CH_SHORT[c], 9, y + 14);
+  if (flash) canvas.fillCircle(13, y + 4, 2, TFT_WHITE);  // a pulse just came in
+  if (!en) {
+    canvas.setTextDatum(MR_DATUM);
+    canvas.setTextColor(0x8410);
+    canvas.drawString("off", 126, y + 14);
+    canvas.setTextDatum(TL_DATUM);
+    return;
+  }
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextDatum(TL_DATUM);
+  canvas.setTextColor(0x8410);
+  canvas.drawString("week", 23, y + 4);
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(TR_DATUM);
+  canvas.setTextColor(TFT_WHITE);
+  canvas.drawString(weekOk ? fmtLitres(weekL) : String("--"), 126, y);
+
+  canvas.setFont(&fonts::Font0);
+  String counter = String((unsigned long long)pulses);
+  String total = "tot " + fmtLitres(totalL);
+  if (canvas.textWidth(total) + canvas.textWidth(counter) > 98) total = fmtLitres(totalL);
+  canvas.setTextColor(0xAD55);
+  canvas.setTextDatum(TL_DATUM);
+  canvas.drawString(total, 23, y + 19);
+  canvas.setTextColor(COUNTER_COLOR);
+  canvas.setTextDatum(TR_DATUM);
+  canvas.drawString(counter, 126, y + 19);
+  canvas.setTextDatum(TL_DATUM);
+}
+
+// Gateway-only screen. Page 0: one row per reader with this week's litres.
+// Tap the screen: next page = one machine with week / total / counter per inlet.
 static int gwPage = 0;
 
 static void drawGateway() {
@@ -865,7 +1075,7 @@ static void drawGateway() {
 
   if (gwPage == 0) {
     // ---- list of machines
-    canvas.drawString("Machines", 2, 0);
+    canvas.drawString("This week", 2, 0);
     canvas.setTextDatum(TR_DATUM);
     canvas.setTextColor(0x8410);
     canvas.drawString(String(n), 126, 0);
@@ -885,10 +1095,16 @@ static void drawGateway() {
       char name[34];
       strncpy(name, list[i].machine, sizeof name);
       name[33] = 0;
-      double total = 0;
-      for (int c = 0; c < list[i].nch; c++)
-        if (list[i].enabled[c]) total += (double)list[i].pulses[c] * list[i].lpp[c];
-      String right = fmtLitres(total);
+      double week = 0;
+      bool weekOk = true;
+      String mac = macStr(list[i].mac);
+      for (int c = 0; c < list[i].nch; c++) {
+        if (!list[i].enabled[c]) continue;
+        double w;
+        if (weekLitres(mac, list[i].chName[c], list[i].pulses[c], list[i].lpp[c], w)) week += w;
+        else weekOk = false;
+      }
+      String right = weekOk ? fmtLitres(week) : String("--");
       String nm = name;
       canvas.setTextColor(late ? TFT_ORANGE : TFT_WHITE);
       while (nm.length() > 1 && canvas.textWidth(nm) + canvas.textWidth(right) > 118) nm.remove(nm.length() - 1);
@@ -912,21 +1128,12 @@ static void drawGateway() {
     canvas.setTextColor(0x8410);
     canvas.drawString(String(gwPage) + "/" + String(n), 126, 0);
     canvas.drawFastHLine(0, 17, 128, 0x4208);
+    String mac = macStr(m.mac);
     for (int c = 0; c < NUM_CH; c++) {
-      int y = 21 + c * 30;
       bool en = c < m.nch && m.enabled[c];
-      canvas.fillRoundRect(0, y, 18, 26, 3, en ? chColor[c] : 0x4208);
-      canvas.setFont(&fonts::Font2);
-      canvas.setTextColor(TFT_BLACK);
-      canvas.setTextDatum(MC_DATUM);
-      canvas.drawString(CH_SHORT[c], 9, y + 13);
-      canvas.setTextDatum(MR_DATUM);
-      if (!en) { canvas.setTextColor(0x8410); canvas.drawString("off", 126, y + 13); continue; }
-      String v = showPulses ? String((unsigned long long)m.pulses[c]) : fmtLitres((double)m.pulses[c] * m.lpp[c]);
-      canvas.setFont(&fonts::Font4);
-      if (canvas.textWidth(v) > 104) canvas.setFont(&fonts::Font2);
-      canvas.setTextColor(TFT_WHITE);
-      canvas.drawString(v, 126, y + 14);
+      double w = 0;
+      bool wOk = en && weekLitres(mac, m.chName[c], m.pulses[c], m.lpp[c], w);
+      drawInletRow(21 + c * 30, c, en, wOk, w, en ? (double)m.pulses[c] * m.lpp[c] : 0, en ? m.pulses[c] : 0, false);
     }
     canvas.setTextDatum(TL_DATUM);
     canvas.drawFastHLine(0, 112, 128, 0x4208);
@@ -983,27 +1190,14 @@ static void drawScreen() {
     return;
   }
 
-  // 3 rows: Cold / Warm / Hot
+  // 3 rows: Cold / Warm / Hot, each with this week / total / counter
+  String myMac = WiFi.macAddress();
   for (int i = 0; i < NUM_CH; i++) {
-    int y = 21 + i * 30;
-    canvas.fillRoundRect(0, y, 18, 26, 3, st[i].en ? chColor[i] : 0x4208);
-    canvas.setFont(&fonts::Font2);
-    canvas.setTextColor(TFT_BLACK);
-    canvas.setTextDatum(MC_DATUM);
-    canvas.drawString(CH_SHORT[i], 9, y + 13);
-    canvas.setTextDatum(MR_DATUM);
-    if (!st[i].en) {
-      canvas.setTextColor(0x8410);
-      canvas.drawString("off", 126, y + 13);
-      continue;
-    }
-    String v = showPulses ? String((unsigned long long)getPulses(i)) : fmtLitres(litres(i));
-    canvas.setFont(&fonts::Font4);
-    if (canvas.textWidth(v) > 104) canvas.setFont(&fonts::Font2);
-    canvas.setTextColor(TFT_WHITE);
-    canvas.drawString(v, 126, y + 14);
-    // dot flashes when a pulse comes in
-    if (millis() - st[i].lastPulseMs < 300 && st[i].lastPulseMs != 0) canvas.fillCircle(22, y + 4, 2, chColor[i]);
+    uint64_t p = getPulses(i);
+    double w = 0;
+    bool wOk = st[i].en && weekLitres(myMac, CH_NAMES[i], p, cfg.ch[i].lpp, w);
+    bool flash = millis() - st[i].lastPulseMs < 300 && st[i].lastPulseMs != 0;
+    drawInletRow(21 + i * 30, i, st[i].en, wOk, w, (double)p * cfg.ch[i].lpp, p, flash);
   }
   canvas.setTextDatum(TL_DATUM);
 
@@ -1018,7 +1212,7 @@ static void drawScreen() {
   canvas.drawString(foot, 2, 117);
   canvas.setTextColor(0x8410);
   canvas.setTextDatum(TR_DATUM);
-  canvas.drawString(showPulses ? "pulses" : clockStr(time(nullptr)), 126, 117);
+  canvas.drawString(clockStr(time(nullptr)), 126, 117);
   canvas.setTextDatum(TL_DATUM);
   canvas.pushSprite(0, 0);
 }
@@ -1124,7 +1318,7 @@ void loop() {
     M5.Display.sleep();
   }
 
-  // Button: tap = litres/pulses toggle; 5 s = SETUP mode
+  // Button: tap = next machine (gateway screen); 5 s = SETUP mode
   static bool longHandled = false;
   if (M5.BtnA.pressedFor(CONFIG_LONGPRESS_MS) && !longHandled) {
     longHandled = true;
@@ -1136,8 +1330,7 @@ void loop() {
   }
   if (M5.BtnA.wasReleased()) {
     if (!longHandled && !wakePress) {
-      if (cfg.ownMeter) showPulses = !showPulses;
-      else gwPage++;  // next machine (wraps back to the list)
+      if (!cfg.ownMeter) gwPage++;  // next machine (wraps back to the list)
     }
     longHandled = false;
     wakePress = false;

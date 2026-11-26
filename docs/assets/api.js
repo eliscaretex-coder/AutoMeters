@@ -25,6 +25,16 @@ async function get(path, params = {}) {
   return res.json();
 }
 
+// PostgREST returns at most 1000 rows per request: page through bigger results.
+async function getAll(path, params) {
+  const rows = [];
+  for (let offset = 0; ; offset += 1000) {
+    const page = await get(path, { ...params, limit: 1000, offset: offset || undefined });
+    rows.push(...page);
+    if (page.length < 1000) return rows;
+  }
+}
+
 const inIds = (ids) => (ids && ids.length ? `in.(${ids.join(',')})` : undefined);
 
 export const listDevices = () =>
@@ -33,12 +43,13 @@ export const listDevices = () =>
 export const latestTotals = (ids) =>
   get('latest_totals', { select: '*', device_id: inIds(ids) });
 
+// Usage per day (Irish time) from fromDay on, oldest first.
 export const dailyUsage = ({ fromDay, ids }) =>
-  get('daily_usage', { select: 'day,device_id,channel,used_l', day: `gte.${fromDay}`, device_id: inIds(ids), order: 'day.asc' });
+  getAll('daily_usage', { select: 'day,device_id,channel,used_l', day: `gte.${fromDay}`, device_id: inIds(ids), order: 'day.asc,device_id.asc,channel.asc' });
 
 export const channelUsage = ({ ids, since, limit = 300, offset = 0 }) =>
   get('channel_usage', {
-    select: 'reading_id,created_at,device_id,channel,litres,used_l',
+    select: 'reading_id,created_at,device_id,channel,litres,pulses,used_l',
     device_id: inIds(ids),
     created_at: since ? `gte.${since}` : undefined,
     order: 'created_at.desc,reading_id.desc',
