@@ -35,6 +35,7 @@ Atom (firmware/) --HTTPS--> Supabase: rpc/submit_reading --> devices, readings, 
 
 1. **Database:** run `supabase/migrations/20261120000000_water_meter.sql` in the Supabase SQL
    Editor, then `select private.create_ingest_token('Laundry Atoms');` and keep the token.
+   Then run the later files in `supabase/migrations/` in date order (each is safe to run again).
 2. **Web page:** put the publishable key in `docs/assets/config.js`. In GitHub, go to
    **Settings > Pages**, choose **Deploy from a branch**, branch `main`, folder `/docs`.
 3. **Atoms:** flash `firmware/atoms3r_water_meter` and type the key and token on the settings

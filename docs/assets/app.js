@@ -36,7 +36,7 @@ const nf1 = new Intl.NumberFormat('en-IE', { maximumFractionDigits: 1 });
 const fmtL = (v) => {
   if (v == null || Number.isNaN(Number(v))) return '–';
   const n = Number(v);
-  return n >= 100000 ? `${nf1.format(n / 1000)} m³` : `${nf0.format(n)} L`;
+  return `${nf0.format(n)} L`;  // always litres, so every meter and inlet uses the same unit
 };
 const fmtAxis = (v) => (v >= 10000 ? `${nf1.format(v / 1000)} m³` : `${nf0.format(v)} L`);
 const dtFmt = new Intl.DateTimeFormat('en-IE', { timeZone: TIME_ZONE, day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
