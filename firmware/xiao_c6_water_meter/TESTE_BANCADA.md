@@ -33,6 +33,29 @@ XIAO (bateria) --ESP-NOW, sem roteador--> AtomS3R (USB, no Wi-Fi) --internet--> 
 A ligação de cada medidor é a mesma do Atom: **pino → diodo 1N4148 → terminal 2 do 7111**
 (listra do diodo do lado do 7111) e **GND → terminal 6**.
 
+### Sinal de máquina ativa (contato seco do relé)
+
+| | XIAO ESP32-C6 |
+|---|---|
+| Contato do relé, um lado | **D3** |
+| Contato do relé, outro lado | **GND** |
+
+- **Não use os 5 V nem o resistor de 10k.** Os pinos da XIAO aguentam no máximo 3,3 V. O
+  contato seco vai direto entre D3 e GND; o pull-up interno da XIAO faz o resto.
+  Contato fechado = máquina funcionando (opção padrão "Closed to GND").
+- Se o fio já vem com os 5 V pelo resistor de 10k e não dá para mudar: ponha um resistor de
+  **22k entre D3 e GND** (vira ~3,3 V) e escolha "At 3.3 V" na página da XIAO.
+- No SETUP, em **Machine running signal**, marque **Input in use**. O **Filter** (padrão
+  1000 ms) é o tempo que o sinal precisa ficar firme para contar.
+
+### Alimentação pelos 5 V da máquina
+
+- 5 V da máquina no pino **5V** da XIAO e GND no **GND**. Power mode **Always on** (padrão).
+- A XIAO manda um "estou aqui" ao Atom a cada minuto. Se a máquina for desligada (e a XIAO
+  junto), depois de 2,5 min o Atom avisa o Supabase: a máquina aparece como **Switched off**
+  desde a última vez que ele ouviu a XIAO. Quando a energia volta, a XIAO manda o estado e o
+  período "desligada" termina.
+
 ## 2. Arduino IDE (uma vez)
 
 1. Em **File > Preferences > Additional boards manager URLs**:
@@ -48,7 +71,7 @@ A ligação de cada medidor é a mesma do Atom: **pino → diodo 1N4148 → term
    Se aparecer "Sketch too big", escolha **Tools > Partition Scheme > Huge APP** e grave de novo.
 3. Ele mantém as configurações que já tinha. No Serial Monitor (115200) deve aparecer
    `Gateway on: listening for readers on channel N`.
-4. Na página do Atom (`http://<ip-do-atom>/`) aparece a seção **Battery readers**. A opção
+4. Na página do Atom (`http://<ip-do-atom>/`) aparece a seção **XIAO readers**. A opção
    **Gateway** já vem marcada.
 
 ## 4. Gravar a XIAO
@@ -74,13 +97,22 @@ A ligação de cada medidor é a mesma do Atom: **pino → diodo 1N4148 → term
    `Reading 1 -> gateway OK (ch 6, -48 dBm)`, e o LED dá **3 piscadas curtas**.
    Uma piscada longa quer dizer que o Atom não respondeu (veja o item 8).
 2. No Atom, o Serial Monitor mostra `Reader 10:BD:A3:... (Machine 02): reading 1`. Na página
-   do Atom, a XIAO aparece na tabela **Battery readers**, e a coluna **Supabase** muda para
+   do Atom, a XIAO aparece na tabela **XIAO readers**, e a coluna **Supabase** muda para
    `sent hh:mm`.
 3. Encoste **D0** no GND algumas vezes (o LED pisca a cada pulso) e aperte **B** rapidinho para
    mandar na hora. O número de pulsos na tabela do Atom deve subir.
 4. **Teste dormindo:** depois de 10 minutos ela dorme (`going to deep sleep` e a porta COM some).
    Faça 5 pulsos em D0. Ela manda sozinha a cada 15 min. Para testar mais rápido, ponha
    **Send every** em 1 ou 2 no SETUP. O total no Atom e no Supabase deve subir 5.
+
+5. **Teste do sinal de máquina ativa:** encoste **D3** no GND e segure mais de 1 s. O Serial
+   Monitor mostra `Machine STARTED` e logo depois `Reading N (1 machine on/off change(s)) -> gateway OK`.
+   Solte: `Machine STOPPED`. No Atom, a coluna **Machine** mostra `running` / `stopped` e a
+   tela mostra um ponto verde na máquina que está funcionando. Na página web, em
+   **During the day**, aparece a faixa **Machine running** com os horários.
+6. **Teste de máquina desligada:** tire o USB da XIAO por mais de 3 min. O Atom mostra
+   `Reader ... silent for 150 s: machine off -> sent` e a coluna **Machine** fica
+   `switched off`. Ligue de novo: a faixa na página mostra o trecho laranja "Switched off".
 
 ## 7. Bateria
 

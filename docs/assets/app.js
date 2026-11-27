@@ -25,7 +25,7 @@ const PERIODS = {
 };
 const WEEKS_SHOWN = 12;  // rows in the weekly table (also the oldest day loaded)
 
-const state = { period: 'week', selection: ALL_WASHERS, devices: [], chartArgs: null, day: null, dayArgs: null, channels: [] };
+const state = { period: 'week', selection: ALL_WASHERS, devices: [], chartArgs: null, day: null, dayArgs: null, channels: [], runNow: new Map() };
 const $ = (id) => document.getElementById(id);
 
 // ---------------------------------------------------------------------------
@@ -133,6 +133,15 @@ const sumOf = (obj) => Object.values(obj).reduce((a, b) => a + b, 0);
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+// "Running since 14:05" / "Stopped since ..." / "Switched off since ..." for a card
+const RUN_WORD = { running: 'Running', stopped: 'Stopped', off: 'Switched off' };
+function runLine(id) {
+  const r = state.runNow.get(id);
+  if (!r) return '';
+  const since = dayKey(new Date(r.started_at)) === todayKey() ? hmFmt.format(new Date(r.started_at)) : dtFmt.format(new Date(r.started_at));
+  return `<div class="run-now ${r.state === 'running' ? 'on' : r.state === 'off' ? 'pwr' : ''}">${RUN_WORD[r.state] || r.state} since ${since}</div>`;
+}
+
 function renderDevices(totals, weekRows) {
   const box = $('devices');
   if (!state.devices.length) {
@@ -166,6 +175,7 @@ function renderDevices(totals, weekRows) {
           <span class="hdr">Meter</span><span class="hdr num" title="Monday to Sunday">This week</span><span class="hdr num" title="Accumulated since installed">Total</span><span class="hdr num" title="Pulses counted: compare with the 7111">Counter</span>
           ${rows || '<span class="muted small">No readings yet</span><span></span><span></span><span></span>'}
         </div>
+        ${runLine(d.id)}
         <div class="card-foot">Wi-Fi ${d.rssi ?? '–'} dBm · firmware ${esc(d.fw || '–')}</div>
       </article>`;
   };
@@ -329,6 +339,7 @@ async function loadDay() {
     state.dayArgs = { series: lineSeries, formatValue: fmtAxis, formatTime: timeLabel, endT, ariaLabel: 'Litres used since midnight, one line per inlet' };
     $('day-legend').innerHTML = channels.length > 1 ? channels.map((c) => `<span>${swatch(c)}${esc(c)}</span>`).join('') : '';
     renderDayLines($('day-chart'), state.dayArgs);
+    loadRun(day, ids);
 
     const sums = Object.fromEntries(channels.map((c) => [c, hours.reduce((a, r) => a + r[c], 0)]));
     const readings = new Set(mine.map((r) => r.reading_id)).size;
@@ -346,6 +357,74 @@ async function loadDay() {
     console.error(err);
     $('day-chart').innerHTML = `<p class="empty">Could not load this day (${esc(err.message)}).</p>`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// One day: when each machine was running, stopped or switched off
+// ---------------------------------------------------------------------------
+// The UTC instant of Irish midnight at the start of day key (00:00 or 23:00 UTC the day before).
+function dayStartMs(key) {
+  for (const iso of [`${addDays(key, -1)}T23:00:00Z`, `${key}T00:00:00Z`]) {
+    const d = new Date(iso);
+    if (dayKey(d) === key && hmFmt.format(d) === '00:00') return d.getTime();
+  }
+  return new Date(`${key}T00:00:00Z`).getTime();
+}
+const fmtDur = (ms) => {
+  const min = Math.round(ms / 60000);
+  if (min < 60) return `${min} min`;
+  return `${Math.floor(min / 60)} h ${String(min % 60).padStart(2, '0')} min`;
+};
+
+async function loadRun(day, ids) {
+  const box = $('run-box');
+  const start = dayStartMs(day);
+  const end = dayStartMs(addDays(day, 1));
+  let periods;
+  try {
+    periods = await api.machinePeriods({ ids, since: new Date(start).toISOString(), until: new Date(end).toISOString() });
+  } catch (err) {
+    console.warn('Machine running periods not available', err);  // SQL not run yet: hide the block
+    box.hidden = true;
+    return;
+  }
+  if (state.day !== day) return;
+  const now = Date.now();
+  const stop = Math.min(end, now);  // nothing is known after now
+  const byDev = new Map();
+  for (const p of periods) {
+    const a = Math.max(start, new Date(p.started_at).getTime());
+    const b = Math.min(stop, p.ended_at ? new Date(p.ended_at).getTime() : stop);
+    if (b <= a) continue;
+    if (!byDev.has(p.device_id)) byDev.set(p.device_id, []);
+    byDev.get(p.device_id).push({ state: p.state, a, b, startedBefore: new Date(p.started_at).getTime() < start });
+  }
+  const devs = selectedDevices().filter((d) => byDev.has(d.id));
+  box.hidden = !devs.length;
+  if (!devs.length) return;
+
+  const span = end - start;
+  const pct = (t) => `${(((t - start) / span) * 100).toFixed(3)}%`;
+  const hm = (t) => (t >= end ? '24:00' : hmFmt.format(new Date(t)));
+  const ticks = [0, 6, 12, 18, 24].map((h) => `<span style="left:${(h / 24) * 100}%">${String(h).padStart(2, '0')}:00</span>`).join('');
+  const rows = devs.map((d) => {
+    const list = byDev.get(d.id);
+    const sum = (st) => list.filter((x) => x.state === st).reduce((s, x) => s + x.b - x.a, 0);
+    const cycles = list.filter((x) => x.state === 'running').length;
+    const segs = list.map((x) => `<div class="run-seg ${x.state}" style="left:${pct(x.a)};width:${pct(start + x.b - x.a)}" title="${RUN_WORD[x.state]} ${hm(x.a)}–${hm(x.b)} (${fmtDur(x.b - x.a)})"></div>`).join('');
+    const off = sum('off');
+    return `<div class="run-row">
+      <div class="run-name" title="${esc(d.name)}">${esc(d.name)}</div>
+      <div class="run-bar" role="img" aria-label="${esc(d.name)}: running ${fmtDur(sum('running'))}">${segs}</div>
+      <div class="run-axis">${ticks}</div>
+      <div class="run-sum">Running <b>${fmtDur(sum('running'))}</b> · ${cycles} time${cycles === 1 ? '' : 's'} · stopped ${fmtDur(sum('stopped'))}${off ? ` · switched off ${fmtDur(off)}` : ''}</div>
+      <details class="run-list"><summary>Times</summary><table><thead><tr><th>From</th><th>To</th><th>State</th><th class="num">Duration</th></tr></thead><tbody>
+        ${list.map((x) => `<tr><td>${x.startedBefore ? '(before) ' : ''}${hm(x.a)}</td><td>${x.b >= stop && stop === now ? 'now' : hm(x.b)}</td><td>${RUN_WORD[x.state]}</td><td class="num">${fmtDur(x.b - x.a)}</td></tr>`).join('')}
+      </tbody></table></details>
+    </div>`;
+  }).join('');
+  $('run-rows').innerHTML = `<div class="run-legend"><span><i class="on"></i>Running</span><span><i class="off"></i>Stopped</span><span><i class="pwr"></i>Switched off</span><span><i class="unk"></i>No data</span></div>${rows}`;
+  $('run-note').textContent = 'From the "machine running" input of each reader. "Switched off" means the machine had no power (the reader went silent).';
 }
 
 function pickDay(key) {
@@ -368,12 +447,14 @@ async function load() {
     const ids = selectedDevices().map((d) => d.id);
     const allIds = state.devices.map((d) => d.id);
     const mon = thisMonday();
-    const [totals, weekRows, daily, recent] = await Promise.all([
+    const [totals, weekRows, daily, recent, runNow] = await Promise.all([
       api.latestTotals(allIds),
       api.dailyUsage({ fromDay: mon, ids: allIds }),
       ids.length ? api.dailyUsage({ fromDay: addDays(mon, -7 * (WEEKS_SHOWN - 1)), ids }) : [],
       ids.length ? api.channelUsage({ ids, limit: 300 }) : [],
+      api.currentRun().catch(() => []),  // [] until the machine-running SQL is run
     ]);
+    state.runNow = new Map(runNow.map((r) => [r.device_id, r]));
     const channels = sortChannels(new Set(totals.filter((t) => ids.includes(t.device_id)).map((t) => t.channel)));
     const range = periodRange(state.period);
     renderDevices(totals, weekRows);

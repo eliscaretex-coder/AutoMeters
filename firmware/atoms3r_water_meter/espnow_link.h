@@ -10,14 +10,24 @@
 //  - Each packet carries a 64-bit SipHash-2-4 tag made with the network key
 //    (the same text on both sides), so other ESP-NOW devices nearby cannot
 //    add readings.
+//  - Version 2 adds the "machine running" input: its state now and the
+//    changes (on/off) not yet confirmed by the gateway. The gateway still
+//    accepts version 1 readers, so they can be updated one at a time.
+//  - Mains powered readers (fed from the machine) also send a short "still
+//    here" every minute. When they go silent (machine switched off at the
+//    wall), the gateway reports the machine as off from the last time it
+//    heard them; the reader's power-up ends that period.
 // =============================================================================
 #pragma once
 #include <stdint.h>
 #include <string.h>
+#include <stddef.h>
 
 #define LINK_MAGIC 0x4D57      // "WM"
-#define LINK_VERSION 1
+#define LINK_VERSION 2        // this reader / gateway
+#define LINK_VERSION_V1 1     // readers without the running input (gateway accepts both)
 #define LINK_MAX_CH 3
+#define LINK_MAX_EV 8         // running-input changes per packet
 #ifndef MESH_KEY
 #define MESH_KEY "autometers-net"  // default network key (override in secrets.h or on the settings page)
 #endif
@@ -29,6 +39,41 @@ struct __attribute__((packed)) LinkChannel {
   char name[8];
   uint64_t pulses;
   float lpp;
+};
+
+// One change of the "machine running" input
+struct __attribute__((packed)) LinkRunEvent {
+  uint32_t n;          // change number since power-up (with boot: unique, so a resend is not stored twice)
+  uint32_t t_s;        // reader's clock (seconds since power-up) when it changed
+  uint8_t on;          // LINK_EV_ON set = machine started, clear = stopped; LINK_EV_POWERUP = state at power-up
+};
+enum : uint8_t { LINK_EV_ON = 1, LINK_EV_POWERUP = 2 };
+
+enum : uint8_t {
+  LINK_RUN_IN_USE = 1,    // the reader has a "machine running" input
+  LINK_RUN_ACTIVE = 2,    // ... and the machine is running now
+  LINK_KEEPALIVE = 4,     // the reader is mains powered and sends at least every minute:
+                          // when it goes silent, the gateway reports the machine as switched off
+  LINK_ALIVE_ONLY = 8     // this packet is only a "still here" (gateway uploads it only if it has changes)
+};
+
+// Version 1 packet (older readers). Only the gateway uses it.
+struct __attribute__((packed)) LinkReadingV1 {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t type;
+  uint32_t boot;
+  uint32_t seq;
+  uint32_t uptime_s;
+  uint32_t wakes;
+  uint16_t battery_mv;
+  uint8_t power;
+  uint8_t nch;
+  char machine[33];
+  char kind[9];
+  char fw[16];
+  LinkChannel ch[LINK_MAX_CH];
+  uint64_t tag;
 };
 
 struct __attribute__((packed)) LinkReading {
@@ -46,8 +91,14 @@ struct __attribute__((packed)) LinkReading {
   char kind[9];
   char fw[16];
   LinkChannel ch[LINK_MAX_CH];
+  // ---- version 2 ----
+  uint8_t run;         // LINK_RUN_IN_USE | LINK_RUN_ACTIVE
+  uint8_t nev;         // changes in ev[]
+  LinkRunEvent ev[LINK_MAX_EV];
   uint64_t tag;        // SipHash of everything above
 };
+static_assert(sizeof(LinkReading) <= 250, "ESP-NOW packets are at most 250 bytes");
+static_assert(offsetof(LinkReading, run) == offsetof(LinkReadingV1, tag), "version 2 must only add fields at the end");
 
 struct __attribute__((packed)) LinkAck {
   uint16_t magic;
@@ -66,7 +117,15 @@ struct __attribute__((packed)) LinkAck {
 struct RxItem {
   uint8_t mac[6];
   int8_t rssi;
-  LinkReading r;
+  uint8_t ver;         // packet version (the answer must carry the same)
+  bool tagOk;          // network key checked when it arrived
+  uint32_t rxMs;       // millis() when it arrived
+  // Added by the gateway: the machine was switched off (reader silent / restarted)
+  // and, after a silence with no restart, that the reader is back
+  int32_t offN;        // event number for "switched off" (negative, 0 = none)
+  uint32_t offAgoS;    // seconds before rxMs when the reader was last heard
+  int32_t backN;       // event number for "back" (negative, 0 = none)
+  LinkReading r;       // version 1 packets are copied in with run = 0, nev = 0
 };
 
 // ---- SipHash-2-4 ------------------------------------------------------------

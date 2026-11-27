@@ -116,6 +116,36 @@ tr.current td { background: color-mix(in srgb, var(--accent) 7%, transparent); }
 
 .card-foot { margin-top: 8px; font-size: 12px; color: var(--muted); }
 
+/* Machine running timeline (day view) */
+.run-box { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+.run-row { display: grid; grid-template-columns: minmax(90px, 160px) 1fr; gap: 4px 12px; align-items: center; margin-bottom: 10px; }
+.run-name { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-sum { grid-column: 2; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.run-bar { position: relative; height: 18px; border-radius: 4px; background: repeating-linear-gradient(135deg, transparent 0 4px, var(--grid) 4px 6px); border: 1px solid var(--border); overflow: hidden; }
+.run-seg { position: absolute; top: 0; bottom: 0; }
+.run-seg.running { background: var(--ok); }
+.run-seg.stopped { background: var(--axis); }
+.run-seg.off { background: var(--warn); opacity: 0.75; }
+.run-axis { grid-column: 2; position: relative; height: 14px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.run-axis span { position: absolute; transform: translateX(-50%); }
+.run-axis span:first-child { transform: none; }
+.run-axis span:last-child { transform: translateX(-100%); }
+.run-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); margin: 0 0 8px; }
+.run-legend i { display: inline-block; width: 12px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; border: 1px solid var(--border); }
+.run-legend i.on { background: var(--ok); border-color: var(--ok); }
+.run-legend i.off { background: var(--axis); }
+.run-legend i.pwr { background: var(--warn); opacity: 0.75; border-color: var(--warn); }
+.run-legend i.unk { background: repeating-linear-gradient(135deg, transparent 0 3px, var(--grid) 3px 5px); }
+.run-now { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.run-now.on { color: var(--ok); font-weight: 600; }
+.run-now.pwr { color: var(--warn); }
+details.run-list { grid-column: 2; }
+details.run-list summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+@media (max-width: 560px) {
+  .run-row { grid-template-columns: 1fr; }
+  .run-sum, .run-axis, details.run-list { grid-column: 1; }
+}
+
 /* Panels, chart, tables */
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
 .panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; margin-bottom: 8px; }
