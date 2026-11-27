@@ -17,6 +17,12 @@
 //  off (and the XIAO with it) the gateway notices the silence and reports the
 //  machine as off; the XIAO's power-up ends that period.
 //
+//  Firmware update over Wi-Fi: on the Atom's page, "Open setup" on a reader
+//  makes it open its SETUP Wi-Fi at its next send (within a minute). Connect
+//  to "WaterMeter-XXXX" and open http://192.168.4.1/update (user admin and
+//  this page's password), then choose the .bin from Arduino's
+//  Sketch > Export Compiled Binary. The counts are kept.
+//
 //  How it saves battery:
 //  - Between pulses the chip is in deep sleep (~15 uA). Each change of a
 //    contact (close or open) wakes it for a fraction of a second to count.
@@ -54,8 +60,9 @@
 #include <time.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <Update.h>
 
-#define FW_VERSION "3.2.0-c6"
+#define FW_VERSION "3.3.0-c6"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -225,6 +232,9 @@ RTC_DATA_ATTR static uint8_t rtcRunOn = 0;              // accepted state: 1 = r
 RTC_DATA_ATTR static uint32_t rtcRunN = 0;              // changes since power-up
 RTC_DATA_ATTR static LinkRunEvent rtcEv[RUN_EV_MAX];    // changes the gateway has not confirmed yet
 RTC_DATA_ATTR static uint8_t rtcEvCount = 0;
+RTC_DATA_ATTR static uint8_t rtcPoweredOn = 0;          // this boot started from no power (not a restart)
+RTC_DATA_ATTR static uint8_t rtcOpenSetup = 0;          // the gateway asked for SETUP: open it after the restart
+static volatile bool g_remoteSetup = false;             // the gateway asked for SETUP (answer to the last send)
 
 // ----------------------------------------------------------------------------
 // Pulse counting (sampled every 1 ms with a debounce filter)
@@ -520,6 +530,7 @@ static bool sendViaGateway(bool aliveOnly = false) {
   // Machine running: state now and the oldest changes not confirmed yet
   uint32_t lastEv = 0;
   if (cfg.power == POWER_ALWAYS_ON) r.run |= LINK_KEEPALIVE;
+  if (rtcPoweredOn) r.run |= LINK_POWERED_UP;
   if (aliveOnly) r.run |= LINK_ALIVE_ONLY;
   if (rs.en) {
     r.run |= LINK_RUN_IN_USE | (rs.on ? LINK_RUN_ACTIVE : 0);
@@ -576,6 +587,10 @@ static bool sendViaGateway(bool aliveOnly = false) {
     lastSendOk = true;
     lastSendOkMs = millis();
     lastSendMsg = "gateway OK (ch " + String(rtcLinkChannel) + ", " + String(ackPkt.rssi) + " dBm)";
+    if (ackPkt.cmd == LINK_CMD_SETUP) {
+      g_remoteSetup = true;
+      Serial.println("The gateway asks for SETUP mode (firmware update)");
+    }
   } else {
     rtcLinkChannel = 0;
     lastSendOk = false;
@@ -694,6 +709,12 @@ static void handleWake(esp_sleep_wakeup_cause_t cause) {
   if ((time(nullptr) >= rtcNextSend || runNow) && linkReady()) {
     startTickTimer();  // keep counting while the Wi-Fi is on
     sendCycle();
+    if (g_remoteSetup) {  // stay awake in SETUP: restart into it
+      stopTickTimer();
+      saveCounts(true);
+      rtcOpenSetup = 1;
+      esp_restart();
+    }
   }
   goToSleep();
 }
@@ -831,6 +852,7 @@ static void handleRoot() {
   h += "</fieldset><button type='submit'>Save count</button></form>";
 
   h += "<h2>Test</h2><form method='post' action='/send'><button type='submit'>Send a reading now</button></form>";
+  h += "<h2>Firmware</h2><div class='muted'>Now " FW_VERSION ". <a href='/update'>Update over Wi-Fi</a> (asks for the page password).</div>";
   if (configMode) h += "<form method='post' action='/exit'><button type='submit' style='background:#55606b'>Leave SETUP mode</button></form>";
   h += "</body></html>";
   server.send(200, "text/html; charset=utf-8", h);
@@ -918,12 +940,64 @@ static void handleExit() {
   ESP.restart();
 }
 
+// ---- Firmware update (SETUP page) -----------------------------------------
+// Always asks for the page password (user admin), even in SETUP mode.
+static bool otaAllowed = false;
+static String otaMsg;
+
+static void handleUpdatePage() {
+  if (!server.authenticate("admin", cfg.adminPass.c_str())) { server.requestAuthentication(BASIC_AUTH, "Water meter"); return; }
+  String h = FPSTR(PAGE_HEAD);
+  h += "<h1>Firmware update</h1><div class='muted'>Now: " FW_VERSION " &middot; " + esc(cfg.machine) + "</div>";
+  h += "<p>Choose the <b>.bin</b> made by Arduino IDE (Sketch &gt; Export Compiled Binary, board XIAO_ESP32C6). "
+       "Settings and counts are kept. Takes about 30 s, then the XIAO restarts.</p>";
+  h += "<form method='post' action='/update' enctype='multipart/form-data'><input type='file' name='fw' accept='.bin' required>"
+       "<button type='submit'>Update</button></form><p><a href='/'>Back</a></p></body></html>";
+  server.send(200, "text/html; charset=utf-8", h);
+}
+
+static void handleUpdateUpload() {
+  HTTPUpload &u = server.upload();
+  if (u.status == UPLOAD_FILE_START) {
+    otaAllowed = server.authenticate("admin", cfg.adminPass.c_str());
+    otaMsg = "";
+    if (!otaAllowed) return;
+    saveCounts(true);
+    Serial.printf("Firmware update: %s\n", u.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) otaMsg = Update.errorString();
+  } else if (!otaAllowed || otaMsg.length()) {
+    if (u.status == UPLOAD_FILE_ABORTED) Update.abort();
+    return;
+  } else if (u.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(u.buf, u.currentSize) != u.currentSize) otaMsg = Update.errorString();
+  } else if (u.status == UPLOAD_FILE_END) {
+    if (!Update.end(true)) otaMsg = Update.errorString();
+    else Serial.printf("Firmware update: %u bytes OK\n", (unsigned)u.totalSize);
+  } else if (u.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    otaMsg = "upload cancelled";
+  }
+}
+
+static void handleUpdateDone() {
+  if (!otaAllowed) { server.requestAuthentication(BASIC_AUTH, "Water meter"); return; }
+  if (otaMsg.length() || !Update.isFinished()) {
+    sendMessagePage("Update failed", "Nothing was changed: " + esc(otaMsg.length() ? otaMsg : String("incomplete file")), true);
+    return;
+  }
+  sendMessagePage("Updated", "Restarting with the new firmware. The counts are kept.", false);
+  delay(1500);
+  ESP.restart();
+}
+
 static void setupServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/counts", HTTP_POST, handleCounts);
   server.on("/send", HTTP_POST, handleSendNow);
   server.on("/exit", HTTP_POST, handleExit);
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.onNotFound([]() {
     if (configMode) {
       server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
@@ -966,8 +1040,14 @@ void setup() {
     handleWake(cause);  // does not return
   }
 
+  // SETUP asked by the gateway before this restart (battery mode)
+  bool remoteSetup = rtcMagic == RTC_MAGIC && rtcOpenSetup == 1;
+  rtcOpenSetup = 0;
   // Power-up, RESET button or restart: counts come back from flash
   if (rtcMagic != RTC_MAGIC || !fromSleep) {
+    esp_reset_reason_t rr = esp_reset_reason();
+    // From no power (machine switched on) or the RESET button; not a restart after settings / update
+    rtcPoweredOn = (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT || rr == ESP_RST_UNKNOWN || rr == ESP_RST_EXT) ? 1 : 0;
     loadCountsFromFlash();
     rtcMagic = RTC_MAGIC;
     rtcBootId = esp_random();
@@ -992,13 +1072,13 @@ void setup() {
   if (rs.en) {
     // State at power-up (also marks that the reader was off before, e.g. no 5 V)
     rs.on = runRaw();
-    pushRunEvent(rs.on | LINK_EV_POWERUP, (uint32_t)time(nullptr));
+    pushRunEvent(rs.on | (rtcPoweredOn ? LINK_EV_POWERUP : 0), (uint32_t)time(nullptr));
     g_runChanged = false;  // goes with the first reading, 3 s after start-up
   }
   startTickTimer();
 
   // 3 s window: press BOOT for SETUP
-  bool wantSetup = !linkReady();
+  bool wantSetup = !linkReady() || remoteSetup;
   if (!wantSetup) {
     Serial.println("Press BOOT now (LED blinking) for SETUP mode...");
     uint32_t t0 = millis();
@@ -1061,6 +1141,14 @@ void loop() {
   } else {
     if (bootDownAt && !configMode && millis() - bootDownAt > 50 && millis() - bootDownAt < 1000) sendRequested = true;
     bootDownAt = 0;
+  }
+
+  // The gateway asked for SETUP (to update the firmware): open it now
+  if (g_remoteSetup && !configMode) {
+    g_remoteSetup = false;
+    saveCounts(true);
+    startConfigMode();
+    setupServer();
   }
 
   // SETUP times out

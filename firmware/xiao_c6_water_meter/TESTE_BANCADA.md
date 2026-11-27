@@ -68,7 +68,8 @@ A ligação de cada medidor é a mesma do Atom: **pino → diodo 1N4148 → term
 1. Abra `atoms3r_water_meter/atoms3r_water_meter.ino`. Na mesma pasta precisam estar
    `secrets.h`, `supabase_roots.h` e `espnow_link.h`.
 2. Placa: a mesma de antes (AtomS3R / AtomS3), com **USB CDC On Boot: Enabled**. Clique em Upload.
-   Se aparecer "Sketch too big", escolha **Tools > Partition Scheme > Huge APP** e grave de novo.
+   Escolha **Tools > Partition Scheme > 8M with spiffs (3MB APP/1.5MB SPIFFS)**. Esse esquema
+   tem espaço para atualizar pelo Wi-Fi (o "Huge APP" não tem). As configurações do Atom são mantidas.
 3. Ele mantém as configurações que já tinha. No Serial Monitor (115200) deve aparecer
    `Gateway on: listening for readers on channel N`.
 4. Na página do Atom (`http://<ip-do-atom>/`) aparece a seção **XIAO readers**. A opção
@@ -114,7 +115,28 @@ A ligação de cada medidor é a mesma do Atom: **pino → diodo 1N4148 → term
    `Reader ... silent for 150 s: machine off -> sent` e a coluna **Machine** fica
    `switched off`. Ligue de novo: a faixa na página mostra o trecho laranja "Switched off".
 
-## 7. Bateria
+## 7. Atualizar o firmware pelo Wi-Fi
+
+O .bin sai do Arduino IDE em **Sketch > Export Compiled Binary** (fica na pasta `build/` do
+sketch; use o arquivo `.ino.bin`, não o `.merged.bin` nem o `.bootloader.bin`).
+
+**Atom:** abra `http://<ip-do-atom>/update` (usuário `admin` e a senha da página), escolha o
+`.bin` do Atom e clique em **Update**. Ele reinicia sozinho com as mesmas configurações.
+Na primeira vez, grave pelo USB com o esquema "8M with spiffs" (item 3); depois disso é só pelo Wi-Fi.
+
+**XIAO (já instalada na máquina):**
+1. Na página do Atom, na tabela **XIAO readers**, clique em **Open setup** na máquina.
+2. No próximo envio (até 1 min), a XIAO abre a rede **WaterMeter-XXXX** (senha `watermeter`)
+   por 15 minutos. Nesse tempo o Atom não marca a máquina como desligada.
+3. Conecte o celular ou o notebook nessa rede e abra `http://192.168.4.1/update`
+   (usuário `admin` e a senha da página da XIAO).
+4. Escolha o `.bin` da XIAO (placa XIAO_ESP32C6) e clique em **Update**. Uns 30 s depois ela
+   reinicia com o firmware novo. As contagens e configurações são mantidas.
+
+Dica: troque a senha da página (campo "Password for this page") em cada XIAO e no Atom, porque
+a padrão `watermeter` é a mesma da rede de SETUP.
+
+## 8. Bateria
 
 - Solde o vermelho no pad **BAT+** e o preto no **BAT−**, embaixo da placa. Atenção à
   polaridade: invertida, queima a placa.
@@ -122,7 +144,7 @@ A ligação de cada medidor é a mesma do Atom: **pino → diodo 1N4148 → term
   do meio no pad **MTMS**. A tensão aparece na tabela do Atom e vai ao Supabase como `battery_v`.
 - Consumo dormindo: multímetro em µA em série com o fio vermelho. O esperado é de 15 a 40 µA.
 
-## 8. Se a XIAO não achar o Atom
+## 9. Se a XIAO não achar o Atom
 
 - Confira se o Atom está no Wi-Fi e se mostrou `Gateway on`.
 - Confira se a **Network key** é igual nas duas. Na página do Atom aparece
