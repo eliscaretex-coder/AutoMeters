@@ -41,6 +41,15 @@ Power the Atom from a 5 V USB-C charger or from the 5V and GND pins. Mount it in
 
 ---
 
+### Machine running signal (XIAO readers)
+
+A dry relay contact that closes while the machine runs goes straight between **D3** and **GND**
+of the XIAO (internal pull-up, no external voltage: the pins take 3.3 V at most). The XIAO sends
+each start and stop at once; the web page shows the periods in **During the day**. XIAOs fed
+from the machine's 5 V (Power mode "Always on") say "still here" to the Atom every minute, so a
+machine switched off at the wall shows as **Switched off**. Run
+`supabase/migrations/20261127000000_machine_running.sql` once in the SQL Editor for this.
+
 ## 2. Supabase (once only, shared by all machines)
 
 1. Open the Supabase project, then **SQL Editor > New query**.

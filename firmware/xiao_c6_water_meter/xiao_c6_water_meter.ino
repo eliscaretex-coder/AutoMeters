@@ -5,6 +5,18 @@
 //  that drives each Trumeter 7111 counter, and sends the totals over ESP-NOW
 //  to the AtomS3R gateway, which forwards them to Supabase.
 //
+//  "Machine running" input (optional): a contact or optocoupler to GND that
+//  tells when the machine is working. Each change (start / stop) is sent to
+//  the gateway at once, with the time it happened, so the web page can show
+//  when the machine ran and when it stood still. A change the gateway did not
+//  confirm is kept (up to 16) and goes with the next send.
+//
+//  Power: "Always on" (default) for units fed from the machine's 5 V. Every
+//  pin can be used, the readings go out every "Send every (min)" and a short
+//  "still here" goes to the gateway every minute: when the machine is switched
+//  off (and the XIAO with it) the gateway notices the silence and reports the
+//  machine as off; the XIAO's power-up ends that period.
+//
 //  How it saves battery:
 //  - Between pulses the chip is in deep sleep (~15 uA). Each change of a
 //    contact (close or open) wakes it for a fraction of a second to count.
@@ -23,9 +35,11 @@
 //
 //  Pins (contacts to GND, internal pull-up, through a 1N4148 diode to the 7111):
 //    Cold = D0 (GPIO0), Warm = D1 (GPIO1), Hot = D2 (GPIO2)
+//    Machine running = D3 (GPIO21): dry relay contact between D3 and GND (no 5 V!)
 //    Battery voltage: 2 x 1 MOhm divider from BAT+ to the MTMS pad (GPIO4).
-//  Only GPIO0-7 can wake the ESP32-C6 from deep sleep, so the pulse inputs
-//  must stay on D0, D1, D2 or the MTDI/MTCK/MTDO pads underneath.
+//  Only GPIO0-7 can wake the ESP32-C6 from deep sleep, so in "Battery" mode
+//  every input must be on D0, D1, D2 or the MTDI/MTCK/MTDO pads underneath.
+//  In "Always on" mode D3 to D10 can be used as well.
 // =============================================================================
 #include <WiFi.h>
 #include <WebServer.h>
@@ -41,7 +55,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 
-#define FW_VERSION "3.1.0-c6"
+#define FW_VERSION "3.2.0-c6"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -68,6 +82,14 @@ static const char *CH_NAMES[NUM_CH] = {"Cold", "Warm", "Hot"};
 static const uint8_t ALLOWED_PINS[] = {0, 1, 2, 5, 6, 7};
 static const char *PIN_LABELS[] = {"D0", "D1", "D2", "MTDI pad (G5)", "MTCK pad (G6)", "MTDO pad (G7)"};
 static const uint8_t DEFAULT_PINS[NUM_CH] = {0, 1, 2};
+// Pins for the "machine running" input: the ones above, then D3-D10 (Always on mode only)
+static const uint8_t RUN_PINS[] = {0, 1, 2, 5, 6, 7, 21, 22, 23, 16, 17, 19, 20, 18};
+static const char *RUN_PIN_LABELS[] = {"D0", "D1", "D2", "MTDI pad (G5)", "MTCK pad (G6)", "MTDO pad (G7)",
+                                       "D3", "D4", "D5", "D6", "D7", "D8", "D9", "D10"};
+static const uint8_t DEFAULT_RUN_PIN = 21;  // D3
+static const uint16_t RUN_FILTER_MIN_MS = 20, RUN_FILTER_MAX_MS = 10000;
+static const uint32_t RUN_SEND_GAP_MS = 3000;  // at most one immediate send per 3 s while awake
+static const uint32_t ALIVE_EVERY_MS = 60000;  // Always on: "still here" to the gateway (detects the machine switched off)
 
 static const uint32_t TEST_WINDOW_MS = 10UL * 60 * 1000;   // awake after power-up / reset
 static const uint32_t SETUP_PRESS_WINDOW_MS = 3000;        // press BOOT within this after reset
@@ -105,6 +127,10 @@ struct Config {
   String meshKey;  // ESP-NOW network key, same as on the gateway
   bool configured; // settings saved at least once
   ChannelCfg ch[NUM_CH];
+  bool runEnabled;     // "machine running" input in use
+  uint8_t runPin;
+  bool runActiveLow;   // true: running when the pin is pulled to GND (optocoupler / contact closed)
+  uint16_t runFilterMs;// the input must hold a new level this long to count
 } cfg;
 
 Preferences prefs;
@@ -116,7 +142,7 @@ static void loadConfig() {
   cfg.adminPass = prefs.getString("adm", "watermeter");
   cfg.intervalMin = prefs.getUShort("int", 15);
   cfg.debounceMs = prefs.getUShort("deb", 30);
-  cfg.power = prefs.getUChar("pwr", POWER_BATTERY);
+  cfg.power = prefs.getUChar("pwr", POWER_ALWAYS_ON);
   cfg.meshKey = prefs.getString("mkey", "");
   if (cfg.meshKey.isEmpty()) cfg.meshKey = MESH_KEY;
   cfg.configured = prefs.getBool("done", prefs.isKey("mach"));
@@ -127,7 +153,13 @@ static void loadConfig() {
     snprintf(k, sizeof k, "c%dlpp", i); cfg.ch[i].lpp = prefs.getFloat(k, 1.0f);
     snprintf(k, sizeof k, "c%dmod", i); cfg.ch[i].mode = prefs.getUChar(k, MODE_PULLUP);
   }
+  cfg.runEnabled = prefs.getBool("ren", false);
+  cfg.runPin = prefs.getUChar("rpin", DEFAULT_RUN_PIN);
+  cfg.runActiveLow = prefs.getBool("rlow", true);
+  cfg.runFilterMs = prefs.getUShort("rflt", 1000);
   prefs.end();
+  if (cfg.runFilterMs < RUN_FILTER_MIN_MS) cfg.runFilterMs = RUN_FILTER_MIN_MS;
+  if (cfg.runFilterMs > RUN_FILTER_MAX_MS) cfg.runFilterMs = RUN_FILTER_MAX_MS;
   if (cfg.intervalMin < 1) cfg.intervalMin = 1;
   if (cfg.debounceMs < 2) cfg.debounceMs = 2;
   if (cfg.debounceMs > 500) cfg.debounceMs = 500;
@@ -151,6 +183,10 @@ static void saveConfig() {
     snprintf(k, sizeof k, "c%dlpp", i); prefs.putFloat(k, cfg.ch[i].lpp);
     snprintf(k, sizeof k, "c%dmod", i); prefs.putUChar(k, cfg.ch[i].mode);
   }
+  prefs.putBool("ren", cfg.runEnabled);
+  prefs.putUChar("rpin", cfg.runPin);
+  prefs.putBool("rlow", cfg.runActiveLow);
+  prefs.putUShort("rflt", cfg.runFilterMs);
   prefs.end();
 }
 
@@ -161,6 +197,12 @@ static int pinIndex(int p) {
   return -1;
 }
 static bool pinAllowed(int p) { return pinIndex(p) >= 0; }
+static int runPinIndex(int p) {
+  for (size_t i = 0; i < sizeof RUN_PINS; i++) if (RUN_PINS[i] == p) return (int)i;
+  return -1;
+}
+// The running input can wake the chip only from GPIO0-7
+static bool runPinOk(int p, uint8_t power) { return power == POWER_BATTERY ? pinAllowed(p) : runPinIndex(p) >= 0; }
 
 // ----------------------------------------------------------------------------
 // State kept in RTC memory during deep sleep (lost on power-up / reset, when
@@ -177,6 +219,12 @@ RTC_DATA_ATTR static uint32_t rtcSeq = 0;
 RTC_DATA_ATTR static uint8_t rtcFails = 0;
 RTC_DATA_ATTR static uint32_t rtcWakes = 0;
 RTC_DATA_ATTR static uint8_t rtcLinkChannel = 0;        // gateway's channel, last time it answered
+// "Machine running" input
+static const int RUN_EV_MAX = 16;
+RTC_DATA_ATTR static uint8_t rtcRunOn = 0;              // accepted state: 1 = running
+RTC_DATA_ATTR static uint32_t rtcRunN = 0;              // changes since power-up
+RTC_DATA_ATTR static LinkRunEvent rtcEv[RUN_EV_MAX];    // changes the gateway has not confirmed yet
+RTC_DATA_ATTR static uint8_t rtcEvCount = 0;
 
 // ----------------------------------------------------------------------------
 // Pulse counting (sampled every 1 ms with a debounce filter)
@@ -196,7 +244,71 @@ static volatile uint16_t g_debounce = 30;
 static esp_timer_handle_t tickTimer = nullptr;
 static volatile uint32_t g_lastAnyPulseMs = 0;
 
+// "Machine running" input, sampled with the pulses
+struct RunState {
+  bool en;
+  gpio_num_t pin;
+  bool activeLow;
+  uint8_t on;          // accepted state (1 = running)
+  uint32_t run;        // consecutive ms at the other state
+  uint32_t changeT;    // clock (s) when the other state was first seen
+};
+static RunState rs = {};
+static volatile uint16_t g_runFilter = 1000;
+static volatile bool g_runChanged = false;   // a change is waiting to be sent
+static portMUX_TYPE runMux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint8_t runRaw() {
+  uint8_t lvl = gpio_get_level(rs.pin) ? 1 : 0;
+  return rs.activeLow ? !lvl : lvl;
+}
+
+// Keep a change until the gateway confirms it (the oldest is dropped when full)
+static void pushRunEvent(uint8_t on, uint32_t t) {
+  portENTER_CRITICAL(&runMux);
+  if (rtcEvCount >= RUN_EV_MAX) {
+    memmove(&rtcEv[0], &rtcEv[1], sizeof(LinkRunEvent) * (RUN_EV_MAX - 1));
+    rtcEvCount--;
+  }
+  LinkRunEvent &e = rtcEv[rtcEvCount++];
+  e.n = ++rtcRunN;
+  e.t_s = t;
+  e.on = on;
+  rtcRunOn = on & LINK_EV_ON;
+  g_runChanged = true;
+  portEXIT_CRITICAL(&runMux);
+}
+
+// Forget the changes up to number n (the gateway has them)
+static void dropRunEvents(uint32_t n) {
+  portENTER_CRITICAL(&runMux);
+  int k = 0;
+  while (k < rtcEvCount && rtcEv[k].n <= n) k++;
+  if (k) {
+    memmove(&rtcEv[0], &rtcEv[k], sizeof(LinkRunEvent) * (rtcEvCount - k));
+    rtcEvCount -= k;
+  }
+  if (rtcEvCount) g_runChanged = true;  // more than one packet's worth: send the rest soon
+  portEXIT_CRITICAL(&runMux);
+}
+
+static void tickRun() {
+  if (!rs.en) return;
+  uint8_t v = runRaw();
+  if (v != rs.on) {  // rs.on is 0 or 1
+    if (rs.run == 0) rs.changeT = (uint32_t)time(nullptr);
+    if (++rs.run >= g_runFilter) {
+      rs.on = v;
+      rs.run = 0;
+      pushRunEvent(v, rs.changeT);
+    }
+  } else {
+    rs.run = 0;
+  }
+}
+
 static void tickOnce() {
+  tickRun();
   uint32_t now = millis();
   for (int i = 0; i < NUM_CH; i++) {
     ChState &c = st[i];
@@ -276,6 +388,17 @@ static void setupInputs() {
     if (!c.en) continue;
     gpio_hold_dis(c.pin);
     pinMode(c.pin, cfg.ch[i].mode == MODE_PULLUP ? INPUT_PULLUP : INPUT);
+  }
+  rs.en = cfg.runEnabled && runPinOk(cfg.runPin, cfg.power);
+  rs.pin = (gpio_num_t)cfg.runPin;
+  rs.activeLow = cfg.runActiveLow;
+  rs.on = rtcRunOn;
+  rs.run = 0;
+  g_runFilter = cfg.runFilterMs;
+  if (rs.en) {
+    gpio_hold_dis(rs.pin);
+    // Closed-to-GND contact: pull-up. Signal that brings 3.3 V: pull-down, so an open wire reads "stopped".
+    pinMode(rs.pin, rs.activeLow ? INPUT_PULLUP : INPUT_PULLDOWN);
   }
 }
 
@@ -370,7 +493,8 @@ static void onLinkRecv(const uint8_t *mac, const uint8_t *data, int len) {
   ackGot = true;
 }
 
-static bool sendViaGateway() {
+// aliveOnly: just "still here" (Always on mode), the gateway does not upload it unless it carries changes
+static bool sendViaGateway(bool aliveOnly = false) {
   lastBattery = batteryVolts();
   LinkReading r;
   memset(&r, 0, sizeof r);
@@ -392,6 +516,19 @@ static bool sendViaGateway() {
     strncpy(r.ch[i].name, CH_NAMES[i], sizeof r.ch[i].name);
     r.ch[i].pulses = getPulses(i);
     r.ch[i].lpp = cfg.ch[i].lpp;
+  }
+  // Machine running: state now and the oldest changes not confirmed yet
+  uint32_t lastEv = 0;
+  if (cfg.power == POWER_ALWAYS_ON) r.run |= LINK_KEEPALIVE;
+  if (aliveOnly) r.run |= LINK_ALIVE_ONLY;
+  if (rs.en) {
+    r.run |= LINK_RUN_IN_USE | (rs.on ? LINK_RUN_ACTIVE : 0);
+    portENTER_CRITICAL(&runMux);
+    r.nev = rtcEvCount < LINK_MAX_EV ? rtcEvCount : LINK_MAX_EV;
+    memcpy(r.ev, rtcEv, sizeof(LinkRunEvent) * r.nev);
+    if (r.nev) lastEv = r.ev[r.nev - 1].n;
+    g_runChanged = false;  // these go now; a newer change sets it again
+    portEXIT_CRITICAL(&runMux);
   }
   r.tag = link_tag(cfg.meshKey.c_str(), &r, sizeof r);
 
@@ -434,6 +571,7 @@ static bool sendViaGateway() {
   WiFi.mode(WIFI_OFF);
 
   if (ok) {
+    if (lastEv) dropRunEvents(lastEv);
     rtcLinkChannel = ackPkt.channel ? ackPkt.channel : usedCh;
     lastSendOk = true;
     lastSendOkMs = millis();
@@ -443,7 +581,9 @@ static bool sendViaGateway() {
     lastSendOk = false;
     lastSendMsg = "no answer from the gateway";
   }
-  Serial.printf("Reading %lu -> %s\n", (unsigned long)r.seq, lastSendMsg.c_str());
+  if (!aliveOnly || !ok)
+    Serial.printf("%s %lu (%u machine on/off change(s)) -> %s\n", aliveOnly ? "Still-here" : "Reading",
+                  (unsigned long)r.seq, (unsigned)r.nev, lastSendMsg.c_str());
   return ok;
 }
 
@@ -477,6 +617,16 @@ static void goToSleep() {
     else gpio_pullup_dis(st[i].pin);
     gpio_pulldown_dis(st[i].pin);
     gpio_hold_en(st[i].pin);
+  }
+  rtcRunOn = rs.on;
+  if (rs.en) {
+    // Wake when the input leaves the accepted state
+    uint8_t lvlNow = rs.activeLow ? !rs.on : rs.on;  // pin level of the accepted state
+    if (lvlNow) lowMask |= 1ULL << rs.pin;
+    else highMask |= 1ULL << rs.pin;
+    if (rs.activeLow) { gpio_pullup_en(rs.pin); gpio_pulldown_dis(rs.pin); }
+    else { gpio_pulldown_en(rs.pin); gpio_pullup_dis(rs.pin); }
+    gpio_hold_en(rs.pin);
   }
 #if SOC_PM_SUPPORT_EXT1_WAKEUP && SOC_PM_SUPPORT_EXT1_WAKEUP_MODE_PER_PIN && \
     ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
@@ -522,12 +672,15 @@ static void handleWake(esp_sleep_wakeup_cause_t cause) {
     c.stable = lvl;
   }
   // Watch the contacts until they are steady, so a bounce does not wake us again
+  // (and the running input until its filter has decided)
   g_debounce = cfg.debounceMs;
   uint32_t t0 = millis();
   uint32_t quiet = 0;
-  while (millis() - t0 < 1000) {
+  uint32_t limit = 1000;
+  if (rs.en && cfg.runFilterMs + 200 > limit) limit = cfg.runFilterMs + 200;
+  while (millis() - t0 < limit) {
     tickOnce();
-    bool busy = false;
+    bool busy = rs.en && rs.run;
     for (int i = 0; i < NUM_CH; i++) if (st[i].en && st[i].run) busy = true;
     quiet = busy ? 0 : quiet + 1;
     if (quiet >= cfg.debounceMs) break;
@@ -536,7 +689,9 @@ static void handleWake(esp_sleep_wakeup_cause_t cause) {
   for (int i = 0; i < NUM_CH; i++) rtcPulses[i] = getPulses(i);
 
   if (pulsesSinceSave() >= SAVE_EVERY_PULSES) saveCounts(false);
-  if (time(nullptr) >= rtcNextSend && linkReady()) {
+  // A start / stop goes out at once (unless the gateway was not answering: then at the next retry)
+  bool runNow = g_runChanged && rtcFails == 0;
+  if ((time(nullptr) >= rtcNextSend || runNow) && linkReady()) {
     startTickTimer();  // keep counting while the Wi-Fi is on
     sendCycle();
   }
@@ -611,6 +766,12 @@ static void handleRoot() {
          "</td><td>" + (st[i].en ? (st[i].stable ? "open" : "closed") : "-") + "</td><td>" +
          String((unsigned long long)getPulses(i)) + "</td><td>" + String(litres(i), 1) + "</td></tr>";
   }
+  if (rs.en) {
+    int ri = runPinIndex(cfg.runPin);
+    h += "<tr><td>Machine running</td><td>" + String(ri >= 0 ? RUN_PIN_LABELS[ri] : "?") + "</td><td>" +
+         (gpio_get_level(rs.pin) ? "open" : "closed") + "</td><td colspan='2'><b>" + (rs.on ? "RUNNING" : "stopped") +
+         "</b> &middot; " + String(rtcEvCount) + " change(s) to send</td></tr>";
+  }
   float bv = batteryVolts();
   h += "</table><div class='muted'>Battery: " + (bv > 0 ? String(bv, 2) + " V" : String("no divider")) +
        " &middot; last send: " + esc(lastSendMsg) + "</div>";
@@ -648,6 +809,18 @@ static void handleRoot() {
     h += opt("1", "Internal pull-up: diode to the 7111, optocoupler or bare sensor", cfg.ch[i].mode == MODE_PULLUP);
     h += "</select></fieldset>";
   }
+  h += "<h2>Machine running signal</h2><fieldset><legend>Running input</legend>";
+  h += "<label><input type='checkbox' name='ren' value='1'" + String(cfg.runEnabled ? " checked" : "") + "> Input in use</label>";
+  h += "<div class='row'><div><label>Pin</label><select name='rpin'>";
+  for (size_t a = 0; a < sizeof RUN_PINS; a++)
+    h += opt(String(RUN_PINS[a]), String(RUN_PIN_LABELS[a]) + (pinAllowed(RUN_PINS[a]) ? "" : " (Always on only)"), cfg.runPin == RUN_PINS[a]);
+  h += "</select></div><div><label>Filter (ms)</label><input name='rflt' type='number' min='" + String(RUN_FILTER_MIN_MS) +
+       "' max='" + String(RUN_FILTER_MAX_MS) + "' value='" + String(cfg.runFilterMs) + "'></div></div>";
+  h += "<label>The machine is running when the input is</label><select name='rlow'>" +
+       opt("1", "Closed to GND: relay contact between the pin and GND (internal pull-up)", cfg.runActiveLow) +
+       opt("0", "At 3.3 V: a signal that brings 3.3 V (internal pull-down)", !cfg.runActiveLow) + "</select>";
+  h += "<div class='muted'>The pins take 3.3 V at most: never 5 V, 24 V or 230 V. A dry relay contact goes straight between the pin and GND. "
+       "A change must hold for the filter time to count.</div></fieldset>";
   h += "<button type='submit'>Save and restart</button></form>";
 
   h += "<h2>Match the count to the 7111</h2><form method='post' action='/counts'><fieldset><legend>Current pulses</legend>";
@@ -699,6 +872,16 @@ static void handleSave() {
     for (int j = i + 1; j < NUM_CH; j++)
       if (n.ch[i].enabled && n.ch[j].enabled && n.ch[i].pin == n.ch[j].pin)
         err += String(CH_NAMES[i]) + " and " + CH_NAMES[j] + " are on the same pin. ";
+  n.runEnabled = server.hasArg("ren");
+  n.runPin = (uint8_t)server.arg("rpin").toInt();
+  n.runActiveLow = server.arg("rlow").toInt() != 0;
+  n.runFilterMs = constrain(server.arg("rflt").toInt(), RUN_FILTER_MIN_MS, RUN_FILTER_MAX_MS);
+  if (n.runEnabled) {
+    if (runPinIndex(n.runPin) < 0) err += "Invalid pin for the running input. ";
+    else if (!runPinOk(n.runPin, n.power)) err += "In Battery mode the running input must be on D0-D2 or a G5/G6/G7 pad (only these wake the chip). ";
+    for (int i = 0; i < NUM_CH; i++)
+      if (n.ch[i].enabled && n.ch[i].pin == n.runPin) err += String("The running input and ") + CH_NAMES[i] + " are on the same pin. ";
+  }
   if (err.length()) { sendMessagePage("Nothing was saved", esc(err), true); return; }
 
   cfg = n;
@@ -791,6 +974,9 @@ void setup() {
     rtcSeq = 0;
     rtcFails = 0;
     rtcWakes = 0;
+    rtcRunN = 0;
+    rtcEvCount = 0;
+    rtcRunOn = 0;
   }
   delay(300);  // give the USB serial a moment
   Serial.printf("\nWater meter %s on XIAO ESP32-C6, %s\n", FW_VERSION, macString().c_str());
@@ -803,6 +989,12 @@ void setup() {
   setupInputs();
   delay(5);
   for (int i = 0; i < NUM_CH; i++) st[i].stable = st[i].en ? (gpio_get_level(st[i].pin) ? 1 : 0) : 1;
+  if (rs.en) {
+    // State at power-up (also marks that the reader was off before, e.g. no 5 V)
+    rs.on = runRaw();
+    pushRunEvent(rs.on | LINK_EV_POWERUP, (uint32_t)time(nullptr));
+    g_runChanged = false;  // goes with the first reading, 3 s after start-up
+  }
   startTickTimer();
 
   // 3 s window: press BOOT for SETUP
@@ -826,6 +1018,7 @@ void setup() {
   else Serial.println("Battery: no divider on the MTMS pad");
   for (int i = 0; i < NUM_CH; i++)
     if (st[i].en) Serial.printf("%s on GPIO%d: contact %s\n", CH_NAMES[i], st[i].pin, st[i].stable ? "open" : "closed");
+  if (rs.en) Serial.printf("Machine running input on GPIO%d: %s\n", rs.pin, rs.on ? "RUNNING" : "stopped");
   testWindowStartMs = millis();
 }
 
@@ -846,6 +1039,11 @@ void loop() {
       shown[i] = v;
       Serial.printf("Pulse %s: %llu pulses = %.1f L\n", CH_NAMES[i], (unsigned long long)v, litres(i));
     }
+  }
+  static uint8_t shownRun = 255;
+  if (rs.en && rs.on != shownRun) {
+    if (shownRun != 255) Serial.printf("Machine %s\n", rs.on ? "STARTED" : "STOPPED");
+    shownRun = rs.on;
   }
   if (!configMode) led(g_lastAnyPulseMs && millis() - g_lastAnyPulseMs < 150);
 
@@ -873,23 +1071,31 @@ void loop() {
 
   // Sending while awake
   static uint32_t connectedAt = 0;
-  static uint32_t lastAttempt = 0;
+  static uint32_t lastAttempt = 0;   // last send of any kind
+  static uint32_t lastReading = 0;   // last full reading (for "Send every")
   static bool firstDone = false;
   if (!configMode) {
     if (connectedAt == 0) connectedAt = millis() - FIRST_SEND_DELAY_MS + 3000;  // first reading 3 s after start-up
     uint32_t interval = (uint32_t)cfg.intervalMin * 60000UL;
     bool due = (!firstDone && millis() - connectedAt >= FIRST_SEND_DELAY_MS) ||
-               (firstDone && millis() - lastAttempt >= interval);
-    if (due || sendRequested) {
+               (firstDone && millis() - lastReading >= interval);
+    // A start / stop goes out at once; if the gateway did not answer, retry after a minute
+    bool runDue = firstDone && g_runChanged && millis() - lastAttempt >= RUN_SEND_GAP_MS;
+    bool runRetry = firstDone && rtcEvCount && !lastSendOk && millis() - lastAttempt >= 60000UL;
+    if (due || sendRequested || runDue || runRetry) {
       sendRequested = false;
       firstDone = true;
-      lastAttempt = millis();
+      lastAttempt = lastReading = millis();
       bool ok = sendViaGateway();
       // LED: 3 short blinks = the gateway got it, 1 long = no answer
       if (ok) for (int b = 0; b < 3; b++) { led(true); delay(80); led(false); delay(120); }
       else { led(true); delay(800); led(false); }
       saveCounts(true);
       scheduleNext(ok);
+    } else if (cfg.power == POWER_ALWAYS_ON && firstDone && millis() - lastAttempt >= ALIVE_EVERY_MS) {
+      // "Still here" every minute: when it stops, the gateway knows the machine was switched off
+      lastAttempt = millis();
+      sendViaGateway(true);
     }
   }
 

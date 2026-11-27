@@ -23,6 +23,12 @@
 //  ESP32-C6) over ESP-NOW, answers them and forwards their readings to
 //  Supabase. The readers find the Atom's Wi-Fi channel by themselves; both
 //  sides need the same "Network key".
+//  Readers with a "machine running" input also send each start / stop; the
+//  Atom forwards them with the time they happened (the web page shows the
+//  periods) and marks a running machine with a green dot on the screen.
+//  Mains powered readers say "still here" every minute; when one goes silent
+//  for 2.5 min the Atom reports its machine as switched off.
+//  Readers with the older firmware (link version 1) still work.
 // =============================================================================
 #include <M5Unified.h>
 #include <WiFi.h>
@@ -41,7 +47,7 @@
 #include <freertos/queue.h>
 #include "supabase_roots.h"
 
-#define FW_VERSION "2.3.1"
+#define FW_VERSION "2.4.0"
 
 // ----------------------------------------------------------------------------
 // Supabase project, publishable key and ingest token
@@ -392,6 +398,10 @@ struct NodeInfo {
   uint32_t lastSeenMs;
   int8_t rssi;
   uint16_t battMv;
+  uint8_t run;     // LINK_RUN_* / LINK_KEEPALIVE flags of the last packet
+  bool offReported;  // reported to Supabase as switched off (silent), waiting for it to come back
+  uint16_t offK;     // switched-off reports for this boot (gives the event numbers -1, -2, -3...)
+  uint32_t offTryMs; // last attempt to report it
   uint8_t nch;
   uint8_t enabled[LINK_MAX_CH];
   char chName[LINK_MAX_CH][9];
@@ -422,12 +432,28 @@ static void onLinkRecv(const esp_now_recv_info_t *info, const uint8_t *data, int
 static void onLinkRecv(const uint8_t *mac, const uint8_t *data, int len) {
   int8_t rssi = 0;
 #endif
-  if (len != (int)sizeof(LinkReading) || !rxQueue) return;
+  if (!rxQueue || len < 4) return;
+  uint8_t ver = data[2];
+  bool v2 = ver == LINK_VERSION && len == (int)sizeof(LinkReading);
+  bool v1 = ver == LINK_VERSION_V1 && len == (int)sizeof(LinkReadingV1);
+  if (!v1 && !v2) return;
   RxItem it;
+  memset(&it, 0, sizeof it);
   memcpy(it.mac, mac, 6);
   it.rssi = rssi;
-  memcpy(&it.r, data, sizeof it.r);
-  if (it.r.magic != LINK_MAGIC || it.r.version != LINK_VERSION || it.r.type != LINK_READING) return;
+  it.ver = ver;
+  it.rxMs = millis();
+  if (v2) {
+    memcpy(&it.r, data, sizeof it.r);
+  } else {
+    // Older reader: same fields up to the tag, no running input
+    memcpy(&it.r, data, offsetof(LinkReadingV1, tag));
+    memcpy(&it.r.tag, data + offsetof(LinkReadingV1, tag), sizeof it.r.tag);
+  }
+  if (it.r.magic != LINK_MAGIC || it.r.type != LINK_READING) return;
+  // The tag covers the packet as it was sent (so check it before the copy is changed)
+  it.tagOk = it.r.tag == link_tag(cfg.meshKey.c_str(), data, len);
+  if (it.r.nev > LINK_MAX_EV) it.r.nev = LINK_MAX_EV;
   xQueueSend(rxQueue, &it, 0);
 }
 
@@ -435,7 +461,7 @@ static void sendAck(const RxItem &it) {
   LinkAck a;
   memset(&a, 0, sizeof a);
   a.magic = LINK_MAGIC;
-  a.version = LINK_VERSION;
+  a.version = it.ver;  // older readers only accept an answer of their own version
   a.type = LINK_ACK;
   a.boot = it.r.boot;
   a.seq = it.r.seq;
@@ -461,7 +487,7 @@ static void gatewayTask(void *) {
   RxItem it;
   for (;;) {
     if (xQueueReceive(rxQueue, &it, portMAX_DELAY) != pdTRUE) continue;
-    if (it.r.tag != link_tag(cfg.meshKey.c_str(), &it.r, sizeof it.r)) { gwBadKey++; continue; }
+    if (!it.tagOk) { gwBadKey++; continue; }
     it.r.machine[sizeof it.r.machine - 1] = 0;
     it.r.kind[sizeof it.r.kind - 1] = 0;
     it.r.fw[sizeof it.r.fw - 1] = 0;
@@ -481,6 +507,25 @@ static void gatewayTask(void *) {
     NodeInfo &n = nodes[idx];
     // The same reading again (our answer got lost): answer, but do not upload twice
     if (n.used && n.boot == it.r.boot && it.r.seq <= n.seq) isNew = false;
+    // Machine switched off? A mains powered reader that restarted was off since we last heard it
+    // (unless that silence was already reported); one that comes back with no restart is "back".
+    it.offN = it.backN = 0;
+    if (isNew && n.used && (n.run & LINK_KEEPALIVE)) {
+      if (n.boot != it.r.boot) {
+        if (!n.offReported) {
+          it.offN = -1;  // first event number of the new boot (the reader's own numbers start at 1)
+          it.offAgoS = (it.rxMs - n.lastSeenMs) / 1000;
+        }
+        n.offReported = false;
+        n.offK = it.offN ? 1 : 0;
+      } else if (n.offReported) {
+        it.backN = -(int32_t)(2 * n.offK);
+        n.offReported = false;
+      }
+    } else if (n.used && n.boot != it.r.boot) {
+      n.offReported = false;
+      n.offK = 0;
+    }
     n.used = true;
     memcpy(n.mac, it.mac, 6);
     strncpy(n.machine, it.r.machine, sizeof n.machine);
@@ -489,6 +534,7 @@ static void gatewayTask(void *) {
     n.lastSeenMs = millis();
     n.rssi = it.rssi;
     n.battMv = it.r.battery_mv;
+    n.run = it.r.run;
     n.nch = it.r.nch;
     for (int c = 0; c < n.nch; c++) {
       n.enabled[c] = it.r.ch[c].enabled;
@@ -497,16 +543,20 @@ static void gatewayTask(void *) {
       n.pulses[c] = it.r.ch[c].pulses;
       n.lpp[c] = it.r.ch[c].lpp;
     }
-    if (isNew) strncpy(n.status, "queued", sizeof n.status);
+    // A "still here" is only uploaded when it carries changes
+    bool upload = isNew && (!(it.r.run & LINK_ALIVE_ONLY) || it.r.nev || it.offN || it.backN);
+    if (upload) strncpy(n.status, "queued", sizeof n.status);
     portEXIT_CRITICAL(&nodesMux);
 
-    if (isNew && xQueueSend(upQueue, &it, 0) != pdTRUE) {
+    if (upload && xQueueSend(upQueue, &it, 0) != pdTRUE) {
       RxItem dropped;  // queue full: drop the oldest, the totals are in the next reading anyway
       xQueueReceive(upQueue, &dropped, 0);
       xQueueSend(upQueue, &it, 0);
     }
-    Serial.printf("Reader %s (%s): reading %lu, %d dBm%s\n", macStr(it.mac).c_str(), it.r.machine,
-                  (unsigned long)it.r.seq, it.rssi, isNew ? "" : " (repeat)");
+    if (!upload && isNew) continue;  // "still here": nothing to print
+    Serial.printf("Reader %s (%s): reading %lu, %d dBm%s%s\n", macStr(it.mac).c_str(), it.r.machine,
+                  (unsigned long)it.r.seq, it.rssi, isNew ? "" : " (repeat)",
+                  (it.r.run & LINK_RUN_IN_USE) ? ((it.r.run & LINK_RUN_ACTIVE) ? ", machine running" : ", machine stopped") : "");
   }
 }
 
@@ -548,6 +598,35 @@ static void uploadNodeReadings() {
       o["pulses"] = (unsigned long long)it.r.ch[c].pulses;
       o["lpp"] = it.r.ch[c].lpp;
       o["litres"] = (double)it.r.ch[c].pulses * (double)it.r.ch[c].lpp;
+    }
+    // Machine running: state now and each start / stop, as "seconds ago" (the
+    // reader's clock only counts from its power-up; Supabase turns it into a time)
+    if ((it.r.run & LINK_RUN_IN_USE) || it.offN || it.backN) {
+      JsonObject run = p["run"].to<JsonObject>();
+      if (it.r.run & LINK_RUN_IN_USE) run["active"] = (it.r.run & LINK_RUN_ACTIVE) != 0;
+      JsonArray evs = run["events"].to<JsonArray>();
+      uint32_t waited = (millis() - it.rxMs) / 1000;  // time in the Atom's queue
+      if (it.offN) {  // switched off since the last time we heard it
+        JsonObject o = evs.add<JsonObject>();
+        o["n"] = it.offN;
+        o["on"] = false;
+        o["power_off"] = true;
+        o["ago_s"] = it.offAgoS + waited;
+      }
+      if (it.backN) {  // back after a silence that was reported as "off" (no restart)
+        JsonObject o = evs.add<JsonObject>();
+        o["n"] = it.backN;
+        o["on"] = (it.r.run & LINK_RUN_ACTIVE) != 0;
+        o["ago_s"] = waited;
+      }
+      for (int e = 0; e < it.r.nev; e++) {
+        const LinkRunEvent &ev = it.r.ev[e];
+        JsonObject o = evs.add<JsonObject>();
+        o["n"] = ev.n;
+        o["on"] = (ev.on & LINK_EV_ON) != 0;
+        if (ev.on & LINK_EV_POWERUP) o["power_up"] = true;
+        o["ago_s"] = (it.r.uptime_s >= ev.t_s ? it.r.uptime_s - ev.t_s : 0) + waited;
+      }
     }
     String msg;
     postReading(doc, msg);
@@ -719,6 +798,52 @@ static bool weekLitres(const String &mac, const char *ch, uint64_t pulses, float
   return ok;
 }
 
+// Called by the sender task: a mains powered reader that has been silent for
+// 2.5 min was switched off with its machine. Report it as off from the last
+// time we heard it (the reader's power-up later ends that period).
+static const uint32_t SILENT_OFF_MS = 150UL * 1000;
+static void reportSilentNodes() {
+  for (int i = 0; i < MAX_NODES; i++) {
+    NodeInfo n;
+    portENTER_CRITICAL(&nodesMux);
+    n = nodes[i];
+    portEXIT_CRITICAL(&nodesMux);
+    uint32_t now = millis();
+    if (!n.used || !(n.run & LINK_KEEPALIVE) || n.offReported || now - n.lastSeenMs < SILENT_OFF_MS) continue;
+    if (n.offTryMs && now - n.offTryMs < 60000UL) continue;
+    uint16_t k = n.offK + 1;
+    char machine[34];
+    strncpy(machine, n.machine, sizeof machine);
+    machine[33] = 0;
+    JsonDocument doc;
+    JsonObject p = doc["payload"].to<JsonObject>();
+    p["report"] = "power_off";
+    p["device"] = macStr(n.mac);
+    p["machine"] = machine;
+    p["boot"] = n.boot;
+    p["via"] = WiFi.macAddress();
+    JsonObject o = p["run"]["events"].to<JsonArray>().add<JsonObject>();
+    o["n"] = -(int32_t)(2 * k - 1);
+    o["on"] = false;
+    o["power_off"] = true;
+    o["ago_s"] = (now - n.lastSeenMs) / 1000;
+    String msg;
+    bool ok = postReading(doc, msg);
+    Serial.printf("Reader %s (%s) silent for %lu s: machine off -> %s\n", macStr(n.mac).c_str(), machine,
+                  (unsigned long)((now - n.lastSeenMs) / 1000), msg.c_str());
+    portENTER_CRITICAL(&nodesMux);
+    if (nodes[i].used && memcmp(nodes[i].mac, n.mac, 6) == 0 && nodes[i].lastSeenMs == n.lastSeenMs) {
+      nodes[i].offTryMs = now ? now : 1;
+      if (ok) {
+        nodes[i].offReported = true;
+        nodes[i].offK = k;
+        strncpy(nodes[i].status, "machine off", sizeof nodes[i].status - 1);
+      }
+    }
+    portEXIT_CRITICAL(&nodesMux);
+  }
+}
+
 static void startGateway() {
   if (gatewayRunning || !cfg.gateway) return;
   WiFi.setSleep(false);  // keep the radio listening for the readers
@@ -748,6 +873,7 @@ static void sendTask(void *) {
         if (cfg.ownMeter) doSend();
       }
       uploadNodeReadings();
+      reportSilentNodes();
       maybeFetchWeek();
     } else {
       connectedAt = 0;
@@ -821,11 +947,11 @@ static void handleRoot() {
 
   // Readers heard over ESP-NOW
   if (cfg.gateway) {
-    h += "<h2>Battery readers</h2>";
+    h += "<h2>XIAO readers</h2>";
     if (!gatewayRunning) h += "<div class='muted'>Starts when the Atom is on the Wi-Fi.</div>";
     else h += "<div class='muted'>Listening on channel " + String(WiFi.channel()) + " &middot; " + String(gwReceived) + " readings received" +
               (gwBadKey ? " &middot; " + String(gwBadKey) + " with a different network key" : String("")) + "</div>";
-    h += "<table><tr><th>Reader</th><th>Last heard</th><th>Signal</th><th>Battery</th><th>Pulses</th><th>Supabase</th></tr>";
+    h += "<table><tr><th>Reader</th><th>Last heard</th><th>Signal</th><th>Battery</th><th>Pulses</th><th>Machine</th><th>Supabase</th></tr>";
     int shown = 0;
     for (int i = 0; i < MAX_NODES; i++) {
       NodeInfo n;
@@ -846,9 +972,12 @@ static void handleRoot() {
       machine[33] = 0;
       h += "<tr><td>" + esc(machine) + "<br><span class='muted'>" + macStr(n.mac) + "</span></td><td>" +
            (ago < 120 ? String(ago) + " s ago" : String(ago / 60) + " min ago") + "</td><td>" + String(n.rssi) + " dBm</td><td>" +
-           (n.battMv > 2000 ? String(n.battMv / 1000.0f, 2) + " V" : String("-")) + "</td><td>" + pulses + "</td><td>" + esc(String(n.status)) + "</td></tr>";
+           (n.battMv > 2000 ? String(n.battMv / 1000.0f, 2) + " V" : String("-")) + "</td><td>" + pulses + "</td><td>" +
+           (n.offReported ? String("<b>switched off</b>") :
+            (n.run & LINK_RUN_IN_USE) ? String((n.run & LINK_RUN_ACTIVE) ? "<b>running</b>" : "stopped") : String("-")) +
+           "</td><td>" + esc(String(n.status)) + "</td></tr>";
     }
-    if (!shown) h += "<tr><td colspan='6' class='muted'>None yet. Press BOOT on a reader to make it send.</td></tr>";
+    if (!shown) h += "<tr><td colspan='7' class='muted'>None yet. Press BOOT on a reader to make it send.</td></tr>";
     h += "</table>";
   }
 
@@ -1115,8 +1244,10 @@ static void drawGateway() {
       String right = weekOk ? fmtLitres(week) : String("--");
       String nm = name;
       canvas.setTextColor(late ? TFT_ORANGE : TFT_WHITE);
-      while (nm.length() > 1 && canvas.textWidth(nm) + canvas.textWidth(right) > 118) nm.remove(nm.length() - 1);
-      canvas.drawString(nm, 2, y);
+      while (nm.length() > 1 && canvas.textWidth(nm) + canvas.textWidth(right) > 112) nm.remove(nm.length() - 1);
+      // Green dot = machine running now
+      if ((list[i].run & LINK_RUN_ACTIVE) && !late) canvas.fillCircle(3, y + 3, 2, TFT_GREEN);
+      canvas.drawString(nm, 8, y);
       canvas.setTextDatum(TR_DATUM);
       canvas.setTextColor(late ? TFT_ORANGE : 0xAD55);
       canvas.drawString(right, 126, y);
@@ -1150,6 +1281,13 @@ static void drawGateway() {
     String foot = ago < 60 ? String(ago) + " min ago" : String(ago / 60) + " h ago";
     canvas.setTextColor(ago > 2UL * cfg.intervalMin + 5 ? TFT_ORANGE : TFT_GREENYELLOW);
     canvas.drawString(foot, 2, 117);
+    if (m.offReported || (m.run & LINK_RUN_IN_USE)) {
+      canvas.setTextDatum(TC_DATUM);
+      bool on = !m.offReported && (m.run & LINK_RUN_ACTIVE);
+      canvas.setTextColor(m.offReported ? TFT_ORANGE : on ? TFT_GREEN : 0x8410);
+      canvas.drawString(m.offReported ? "OFF" : on ? "RUN" : "STOP", 72, 117);
+      canvas.setTextDatum(TL_DATUM);
+    }
     canvas.setTextColor(0x8410);
     canvas.setTextDatum(TR_DATUM);
     canvas.drawString(m.battMv > 2000 ? String(m.battMv / 1000.0f, 2) + " V" : String(m.rssi) + " dBm", 126, 117);

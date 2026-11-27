@@ -57,3 +57,19 @@ export const channelUsage = ({ ids, since, until, limit = 300, offset = 0 }) =>
     limit,
     offset: offset || undefined,
   });
+
+// Machine running / stopped periods that overlap [since, until) (ISO times).
+// ended_at is null while the period is still going.
+export const machinePeriods = ({ ids, since, until }) =>
+  get('machine_periods', {
+    select: 'device_id,state,started_at,ended_at',
+    device_id: inIds(ids),
+    started_at: `lt.${until}`,
+    or: `(ended_at.gt.${since},ended_at.is.null)`,
+    order: 'started_at.asc',
+    limit: 2000,
+  });
+
+// The period each machine is in now (one row per device that has the running input).
+export const currentRun = () =>
+  get('machine_periods', { select: 'device_id,state,started_at', ended_at: 'is.null' });
