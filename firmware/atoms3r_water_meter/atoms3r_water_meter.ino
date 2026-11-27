@@ -29,6 +29,11 @@
 //  Mains powered readers say "still here" every minute; when one goes silent
 //  for 2.5 min the Atom reports its machine as switched off.
 //  Readers with the older firmware (link version 1) still work.
+//
+//  Firmware update over Wi-Fi: http://<atom-ip>/update for the Atom itself
+//  (build with Tools > Partition Scheme > "8M with spiffs (3MB APP/1.5MB
+//  SPIFFS)", the first time over USB). For a XIAO: "Open setup" next to it
+//  on this page, then its own page at http://192.168.4.1/update.
 // =============================================================================
 #include <M5Unified.h>
 #include <WiFi.h>
@@ -44,10 +49,11 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_idf_version.h>
+#include <Update.h>
 #include <freertos/queue.h>
 #include "supabase_roots.h"
 
-#define FW_VERSION "2.4.0"
+#define FW_VERSION "2.5.0"
 
 // ----------------------------------------------------------------------------
 // Supabase project, publishable key and ingest token
@@ -402,6 +408,9 @@ struct NodeInfo {
   bool offReported;  // reported to Supabase as switched off (silent), waiting for it to come back
   uint16_t offK;     // switched-off reports for this boot (gives the event numbers -1, -2, -3...)
   uint32_t offTryMs; // last attempt to report it
+  uint8_t ver;        // link version of the reader (1 = cannot be asked to open SETUP)
+  uint8_t cmdPending; // LINK_CMD_* to send in the next answer
+  uint32_t setupMs;   // when it was told to open SETUP (its silence is not "machine off" for a while)
   uint8_t nch;
   uint8_t enabled[LINK_MAX_CH];
   char chName[LINK_MAX_CH][9];
@@ -411,6 +420,7 @@ struct NodeInfo {
 };
 
 static const int MAX_NODES = 24;
+static const uint32_t SETUP_QUIET_MS = 20UL * 60 * 1000;  // a reader in SETUP is silent up to 15 min
 static NodeInfo nodes[MAX_NODES];
 static portMUX_TYPE nodesMux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t rxQueue = nullptr;   // radio -> gateway task
@@ -457,18 +467,26 @@ static void onLinkRecv(const uint8_t *mac, const uint8_t *data, int len) {
   xQueueSend(rxQueue, &it, 0);
 }
 
-static void sendAck(const RxItem &it) {
+static void sendAck(const RxItem &it, uint8_t cmd) {
   LinkAck a;
   memset(&a, 0, sizeof a);
   a.magic = LINK_MAGIC;
-  a.version = it.ver;  // older readers only accept an answer of their own version
+  a.version = it.ver;  // older readers only accept an answer of their own version (and size)
   a.type = LINK_ACK;
   a.boot = it.r.boot;
   a.seq = it.r.seq;
   a.channel = (uint8_t)WiFi.channel();
   a.rssi = it.rssi;
   memcpy(a.dest, it.mac, 6);
-  a.tag = link_tag(cfg.meshKey.c_str(), &a, sizeof a);
+  size_t len = sizeof a;
+  if (it.ver == LINK_VERSION_V1) {
+    len = sizeof(LinkAckV1);  // no cmd: the tag goes where cmd is
+    uint64_t t = link_tag(cfg.meshKey.c_str(), &a, len);
+    memcpy((uint8_t *)&a + offsetof(LinkAckV1, tag), &t, sizeof t);
+  } else {
+    a.cmd = cmd;
+    a.tag = link_tag(cfg.meshKey.c_str(), &a, sizeof a);
+  }
   esp_now_peer_info_t peer;
   memset(&peer, 0, sizeof peer);
   memcpy(peer.peer_addr, it.mac, 6);
@@ -476,7 +494,7 @@ static void sendAck(const RxItem &it) {
   peer.ifidx = WIFI_IF_STA;
   peer.encrypt = false;
   bool added = esp_now_add_peer(&peer) == ESP_OK;
-  esp_now_send(it.mac, (const uint8_t *)&a, sizeof a);
+  esp_now_send(it.mac, (const uint8_t *)&a, len);
   if (added) {
     delay(5);
     esp_now_del_peer(it.mac);
@@ -492,7 +510,21 @@ static void gatewayTask(void *) {
     it.r.kind[sizeof it.r.kind - 1] = 0;
     it.r.fw[sizeof it.r.fw - 1] = 0;
     if (it.r.nch > LINK_MAX_CH) it.r.nch = LINK_MAX_CH;
-    sendAck(it);  // answer first: the reader waits only ~120 ms
+    // A command waiting for this reader goes in the answer (version 2 readers only)
+    uint8_t cmd = LINK_CMD_NONE;
+    if (it.ver != LINK_VERSION_V1) {
+      portENTER_CRITICAL(&nodesMux);
+      for (int i = 0; i < MAX_NODES; i++)
+        if (nodes[i].used && memcmp(nodes[i].mac, it.mac, 6) == 0 && nodes[i].cmdPending) {
+          cmd = nodes[i].cmdPending;
+          nodes[i].cmdPending = LINK_CMD_NONE;
+          nodes[i].setupMs = millis() | 1;
+          strncpy(nodes[i].status, "SETUP opened", sizeof nodes[i].status - 1);
+        }
+      portEXIT_CRITICAL(&nodesMux);
+    }
+    sendAck(it, cmd);  // answer first: the reader waits only ~120 ms
+    if (cmd) Serial.printf("Reader %s: asked to open SETUP\n", macStr(it.mac).c_str());
     gwReceived++;
 
     bool isNew = true;
@@ -510,9 +542,11 @@ static void gatewayTask(void *) {
     // Machine switched off? A mains powered reader that restarted was off since we last heard it
     // (unless that silence was already reported); one that comes back with no restart is "back".
     it.offN = it.backN = 0;
+    bool inSetup = n.setupMs && it.rxMs - n.setupMs < SETUP_QUIET_MS;  // silent / restarting on purpose
     if (isNew && n.used && (n.run & LINK_KEEPALIVE)) {
       if (n.boot != it.r.boot) {
-        if (!n.offReported) {
+        // Off only when it started from no power (not a restart after settings or an update)
+        if (!n.offReported && !inSetup && (it.r.run & LINK_POWERED_UP)) {
           it.offN = -1;  // first event number of the new boot (the reader's own numbers start at 1)
           it.offAgoS = (it.rxMs - n.lastSeenMs) / 1000;
         }
@@ -535,6 +569,7 @@ static void gatewayTask(void *) {
     n.rssi = it.rssi;
     n.battMv = it.r.battery_mv;
     n.run = it.r.run;
+    n.ver = it.ver;
     n.nch = it.r.nch;
     for (int c = 0; c < n.nch; c++) {
       n.enabled[c] = it.r.ch[c].enabled;
@@ -810,6 +845,7 @@ static void reportSilentNodes() {
     portEXIT_CRITICAL(&nodesMux);
     uint32_t now = millis();
     if (!n.used || !(n.run & LINK_KEEPALIVE) || n.offReported || now - n.lastSeenMs < SILENT_OFF_MS) continue;
+    if (n.setupMs && now - n.setupMs < SETUP_QUIET_MS) continue;  // in SETUP (firmware update): not switched off
     if (n.offTryMs && now - n.offTryMs < 60000UL) continue;
     uint16_t k = n.offK + 1;
     char machine[34];
@@ -975,11 +1011,17 @@ static void handleRoot() {
            (n.battMv > 2000 ? String(n.battMv / 1000.0f, 2) + " V" : String("-")) + "</td><td>" + pulses + "</td><td>" +
            (n.offReported ? String("<b>switched off</b>") :
             (n.run & LINK_RUN_IN_USE) ? String((n.run & LINK_RUN_ACTIVE) ? "<b>running</b>" : "stopped") : String("-")) +
-           "</td><td>" + esc(String(n.status)) + "</td></tr>";
+           "</td><td>" + esc(String(n.status)) +
+           (n.ver >= LINK_VERSION ? "<form method='post' action='/reader-setup' style='margin:0'><input type='hidden' name='mac' value='" + macStr(n.mac) +
+                    "'><button type='submit' style='padding:4px 8px;font-size:12px;margin-top:4px'>" +
+                    (n.cmdPending ? String("Waiting...") : String("Open setup")) + "</button></form>" : String("")) +
+           "</td></tr>";
     }
     if (!shown) h += "<tr><td colspan='7' class='muted'>None yet. Press BOOT on a reader to make it send.</td></tr>";
     h += "</table>";
   }
+
+  h += "<div class='muted' style='margin-top:12px'>Atom firmware " FW_VERSION " &middot; <a href='/update'>Update over Wi-Fi</a></div>";
 
   // Main form
   h += "<form method='post' action='/save'>";
@@ -1120,8 +1162,84 @@ static void handleExit() {
   ESP.restart();
 }
 
+// A reader opens its SETUP Wi-Fi (to update its firmware) at its next send
+static void handleReaderSetup() {
+  if (!checkAuth()) return;
+  String mac = server.arg("mac");
+  bool found = false;
+  portENTER_CRITICAL(&nodesMux);
+  for (int i = 0; i < MAX_NODES; i++)
+    if (nodes[i].used && macStr(nodes[i].mac) == mac) {
+      nodes[i].cmdPending = LINK_CMD_SETUP;
+      strncpy(nodes[i].status, "SETUP asked", sizeof nodes[i].status - 1);
+      found = true;
+    }
+  portEXIT_CRITICAL(&nodesMux);
+  if (!found) { sendMessagePage("Not found", "That reader is not in the list.", true); return; }
+  sendMessagePage("SETUP asked",
+                  "At its next send (within a minute when fed from the machine) the reader opens its Wi-Fi <b>WaterMeter-XXXX</b> "
+                  "(password <code>watermeter</code>) for 15 minutes. Connect to it and open "
+                  "<a href='http://192.168.4.1/update'>http://192.168.4.1/update</a> (user admin, the reader's page password). "
+                  "During those minutes it is not reported as switched off.", true);
+}
+
+// ---- Firmware update of the Atom (asks for the page password, user admin) ----
+static bool otaAllowed = false;
+static String otaMsg;
+
+static void handleUpdatePage() {
+  if (!server.authenticate("admin", cfg.adminPass.c_str())) { server.requestAuthentication(BASIC_AUTH, "Water meter"); return; }
+  String h = FPSTR(PAGE_HEAD);
+  h += "<h1>Atom firmware update</h1><div class='muted'>Now: " FW_VERSION "</div>";
+  h += "<p>Choose the <b>.bin</b> made by Arduino IDE (Sketch &gt; Export Compiled Binary) with "
+       "<b>Partition Scheme: 8M with spiffs (3MB APP/1.5MB SPIFFS)</b>. Settings are kept. The Atom restarts when done.</p>";
+  h += "<form method='post' action='/update' enctype='multipart/form-data'><input type='file' name='fw' accept='.bin' required>"
+       "<button type='submit'>Update</button></form><p><a href='/'>Back</a></p></body></html>";
+  server.send(200, "text/html; charset=utf-8", h);
+}
+
+static void handleUpdateUpload() {
+  HTTPUpload &u = server.upload();
+  if (u.status == UPLOAD_FILE_START) {
+    otaAllowed = server.authenticate("admin", cfg.adminPass.c_str());
+    otaMsg = "";
+    if (!otaAllowed) return;
+    if (cfg.ownMeter) saveCounts(true);
+    Serial.printf("Firmware update: %s\n", u.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) otaMsg = Update.errorString();
+  } else if (!otaAllowed || otaMsg.length()) {
+    if (u.status == UPLOAD_FILE_ABORTED) Update.abort();
+    return;
+  } else if (u.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(u.buf, u.currentSize) != u.currentSize) otaMsg = Update.errorString();
+  } else if (u.status == UPLOAD_FILE_END) {
+    if (!Update.end(true)) otaMsg = Update.errorString();
+    else Serial.printf("Firmware update: %u bytes OK\n", (unsigned)u.totalSize);
+  } else if (u.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    otaMsg = "upload cancelled";
+  }
+}
+
+static void handleUpdateDone() {
+  if (!otaAllowed) { server.requestAuthentication(BASIC_AUTH, "Water meter"); return; }
+  if (otaMsg.length() || !Update.isFinished()) {
+    String why = otaMsg.length() ? otaMsg : String("incomplete file");
+    if (why.indexOf("Space") >= 0 || why.indexOf("space") >= 0)
+      why += " (the first time, flash over USB with Partition Scheme \"8M with spiffs\")";
+    sendMessagePage("Update failed", "Nothing was changed: " + esc(why), true);
+    return;
+  }
+  sendMessagePage("Updated", "Restarting with the new firmware.", false);
+  delay(1500);
+  ESP.restart();
+}
+
 static void setupServer() {
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/reader-setup", HTTP_POST, handleReaderSetup);
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/counts", HTTP_POST, handleCounts);
   server.on("/send", HTTP_POST, handleSendNow);

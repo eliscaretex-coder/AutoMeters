@@ -17,6 +17,8 @@
 //    here" every minute. When they go silent (machine switched off at the
 //    wall), the gateway reports the machine as off from the last time it
 //    heard them; the reader's power-up ends that period.
+//  - The gateway can ask a reader (in its answer) to open its settings Wi-Fi,
+//    so its firmware can be updated without opening the machine.
 // =============================================================================
 #pragma once
 #include <stdint.h>
@@ -47,14 +49,15 @@ struct __attribute__((packed)) LinkRunEvent {
   uint32_t t_s;        // reader's clock (seconds since power-up) when it changed
   uint8_t on;          // LINK_EV_ON set = machine started, clear = stopped; LINK_EV_POWERUP = state at power-up
 };
-enum : uint8_t { LINK_EV_ON = 1, LINK_EV_POWERUP = 2 };
+enum : uint8_t { LINK_EV_ON = 1, LINK_EV_POWERUP = 2 };  // POWERUP: only when it started from no power
 
 enum : uint8_t {
   LINK_RUN_IN_USE = 1,    // the reader has a "machine running" input
   LINK_RUN_ACTIVE = 2,    // ... and the machine is running now
   LINK_KEEPALIVE = 4,     // the reader is mains powered and sends at least every minute:
                           // when it goes silent, the gateway reports the machine as switched off
-  LINK_ALIVE_ONLY = 8     // this packet is only a "still here" (gateway uploads it only if it has changes)
+  LINK_ALIVE_ONLY = 8,    // this packet is only a "still here" (gateway uploads it only if it has changes)
+  LINK_POWERED_UP = 16    // the reader started from no power (not a restart after settings or an update)
 };
 
 // Version 1 packet (older readers). Only the gateway uses it.
@@ -100,6 +103,19 @@ struct __attribute__((packed)) LinkReading {
 static_assert(sizeof(LinkReading) <= 250, "ESP-NOW packets are at most 250 bytes");
 static_assert(offsetof(LinkReading, run) == offsetof(LinkReadingV1, tag), "version 2 must only add fields at the end");
 
+// Answer to a version 1 reader. Only the gateway uses it.
+struct __attribute__((packed)) LinkAckV1 {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t type;
+  uint32_t boot;
+  uint32_t seq;
+  uint8_t channel;
+  int8_t rssi;
+  uint8_t dest[6];
+  uint64_t tag;
+};
+
 struct __attribute__((packed)) LinkAck {
   uint16_t magic;
   uint8_t version;
@@ -109,7 +125,15 @@ struct __attribute__((packed)) LinkAck {
   uint8_t channel;     // gateway's Wi-Fi channel
   int8_t rssi;         // how the gateway heard the reader
   uint8_t dest[6];     // MAC of the reader this answer is for
+  // ---- version 2 ----
+  uint8_t cmd;         // LINK_CMD_*: something the gateway asks the reader to do
   uint64_t tag;
+};
+static_assert(offsetof(LinkAck, cmd) == offsetof(LinkAckV1, tag), "version 2 must only add fields at the end");
+
+enum : uint8_t {
+  LINK_CMD_NONE = 0,
+  LINK_CMD_SETUP = 1   // open the settings Wi-Fi (SETUP mode, page with firmware update) for 15 min
 };
 
 // What the gateway keeps for each packet it hears (defined here so that the
